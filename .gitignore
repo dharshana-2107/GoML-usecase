@@ -1,0 +1,6 @@
+node_modules/
+frontend/dist/
+.lighthouseci/
+loadtest/k6-summary.json
+coverage.out
+.env
