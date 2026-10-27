@@ -1,0 +1,121 @@
+# full stack on one machine:
+#   docker compose up -d --build --wait
+#   docker compose run --rm seed                  # 500 units, opens in 60s
+#   open http://localhost:8080
+#
+# extra tools (not started by "up"):
+#   docker compose run --rm seed -start-in 0s     # open the sale now
+#   docker compose --profile loadtest run --rm k6 # fire the load test
+
+x-api: &api
+  build: { context: ./backend, target: api }
+  environment: &backend-env
+    REDIS_ADDR: redis:6379
+    RABBITMQ_URL: amqp://flash:flash@rabbitmq:5672/
+    DATABASE_URL: postgres://app:app@postgres:5432/flashsale?sslmode=disable
+    SALE_SKU: PHONE-1
+    SALE_TOKEN_SECRET: ${SALE_TOKEN_SECRET:-dev-only-secret-change-me}
+    MAX_IN_FLIGHT: "2000"
+  depends_on:
+    redis: { condition: service_healthy }
+    rabbitmq: { condition: service_healthy }
+  restart: unless-stopped
+  deploy:
+    resources:
+      limits: { cpus: "1", memory: 256M }
+
+services:
+  # ---- data layer -----------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: flashsale
+    volumes:
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d flashsale"]
+      interval: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # append only file: stock tokens survive a redis restart
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxclients", "20000"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: flash
+      RABBITMQ_DEFAULT_PASS: flash
+    ports: ["15672:15672"]   # management ui: http://localhost:15672 (flash / flash)
+    volumes: [rabbitdata:/var/lib/rabbitmq]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      retries: 30
+
+  # ---- stateless api replicas behind nginx -----------------------------------
+  api-1: *api
+  api-2: *api
+  api-3: *api
+
+  # ---- order workers (2 copies, 16 goroutines each) --------------------------
+  worker:
+    build: { context: ./backend, target: worker }
+    environment:
+      <<: *backend-env
+      WORKER_COUNT: "16"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    restart: unless-stopped
+    stop_grace_period: 15s   # time to finish in-flight orders
+    deploy:
+      replicas: 2
+
+  # ---- nginx: serves react + load balances the api ---------------------------
+  gateway:
+    build: { context: ., dockerfile: nginx/Dockerfile }
+    ports: ["8080:80"]
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    depends_on:
+      api-1: { condition: service_healthy }
+      api-2: { condition: service_healthy }
+      api-3: { condition: service_healthy }
+    restart: unless-stopped
+
+  # ---- tools ------------------------------------------------------------------
+  seed:
+    build: { context: ./backend, target: worker }
+    entrypoint: ["/app/seed"]
+    environment: *backend-env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    profiles: [tools]
+
+  k6:
+    image: grafana/k6:latest
+    volumes: ["./loadtest:/scripts"]
+    environment:
+      BASE_URL: http://gateway
+      USERS: ${USERS:-20000}
+    command: ["run", "--summary-export=/scripts/k6-summary.json", "/scripts/checkout.k6.js"]
+    depends_on: [gateway]
+    profiles: [loadtest]
+
+volumes:
+  pgdata:
+  redisdata:
+  rabbitdata:
