@@ -74,6 +74,8 @@ To act as several buyers, use separate private/incognito windows. A second purch
 ## 2. Architecture
 
 ![System architecture](docs/architecture.png)
+![dataflow](docs/dataflow.png)
+
 
 **Lifecycle of one checkout**
 
