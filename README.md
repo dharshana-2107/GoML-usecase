@@ -126,4 +126,4 @@ scripts/             verify-sale.sh
 
 ## Honest limits
 
-This is an assessment build. Payment, reservation expiry, real authentication, CDN/WAF bot challenges, Redis replication and full-scale (100k / 10 s) capacity testing are described in `docs/DESIGN.md` §7 but not implemented.
+This is an assessment build. Reservation expiry, real authentication, CDN/WAF bot challenges, Redis replication and full-scale (100k / 10 s) capacity testing are described in `docs/DESIGN.md` §7 but not implemented.

@@ -21,6 +21,14 @@ func TestTokenRoundTrip(t *testing.T) {
 	}
 }
 
+func TestParseReturnsUser(t *testing.T) {
+	s := NewSessionSigner([]byte("secret"), time.Hour)
+	tok, _ := s.Issue("u_123", time.Now())
+	if id, err := s.Parse(tok, time.Now()); err != nil || id != "u_123" {
+		t.Fatalf("expected u_123, got %q %v", id, err)
+	}
+}
+
 func TestTokenTampering(t *testing.T) {
 	s := NewSigner([]byte("secret"), time.Minute)
 	other := NewSigner([]byte("another-secret"), time.Minute)
@@ -33,12 +41,44 @@ func TestTokenTampering(t *testing.T) {
 	}
 }
 
+// a sale token must never work as a login cookie, and the other way around,
+// even though both are made from the same secret.
+func TestSessionAndSaleTokensAreSeparate(t *testing.T) {
+	secret := []byte("one-shared-secret")
+	sale := NewSigner(secret, time.Hour)
+	session := NewSessionSigner(secret, time.Hour)
+
+	saleTok, _ := sale.Issue("user-1", time.Now())
+	if _, err := session.Parse(saleTok, time.Now()); err == nil {
+		t.Fatal("sale token accepted as a session")
+	}
+	sessTok, _ := session.Issue("user-1", time.Now())
+	if _, err := sale.Parse(sessTok, time.Now()); err == nil {
+		t.Fatal("session token accepted as a sale token")
+	}
+}
+
 func TestValidUserID(t *testing.T) {
 	for id, want := range map[string]bool{
 		"user_42": true, "ab": false, "a b c": false, "drop;table": false,
 	} {
 		if ValidUserID(id) != want {
 			t.Errorf("ValidUserID(%q) should be %v", id, want)
+		}
+	}
+}
+
+func TestNormalizeEmail(t *testing.T) {
+	for raw, want := range map[string]string{
+		"  Alice@Example.COM ": "alice@example.com",
+		"bob@shop.in":          "bob@shop.in",
+		"not-an-email":         "",
+		"Name <a@b.com>":       "",
+		"a@localhost":          "",
+	} {
+		got, err := NormalizeEmail(raw)
+		if (want == "") != (err != nil) || got != want {
+			t.Errorf("NormalizeEmail(%q) = %q, %v; want %q", raw, got, err, want)
 		}
 	}
 }

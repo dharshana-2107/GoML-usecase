@@ -1,5 +1,7 @@
 // thin fetch wrapper: timeouts, safe retries and typed errors.
-import { backoff, sleep, uuid } from "./timing";
+// who you are is carried by an httponly session cookie that the browser sends
+// automatically. javascript never sees it, so it can't be stolen by a script.
+import { backoff, sleep } from "./timing";
 
 export class ApiError extends Error {
   constructor(
@@ -18,11 +20,12 @@ const RETRYABLE = new Set([429, 502, 503, 504]);
 interface Options {
   method?: "GET" | "POST";
   headers?: Record<string, string>;
+  body?: unknown;
   retries?: number;
 }
 
 export async function request<T>(path: string, opts: Options = {}): Promise<T> {
-  const { method = "GET", headers = {}, retries = 0 } = opts;
+  const { method = "GET", headers = {}, body, retries = 0 } = opts;
   for (let attempt = 0; ; attempt++) {
     // abort slow requests so the ui never hangs on a dead connection
     const ctrl = new AbortController();
@@ -31,13 +34,16 @@ export async function request<T>(path: string, opts: Options = {}): Promise<T> {
     try {
       const res = await fetch(path, {
         method,
-        headers: { "X-User-ID": userId(), ...headers },
+        credentials: "same-origin", // send the session cookie
+        headers: body === undefined ? headers : { "Content-Type": "application/json", ...headers },
+        body: body === undefined ? undefined : JSON.stringify(body),
         signal: ctrl.signal,
       });
+      if (res.status === 204) return undefined as T;
       if (res.ok) return (await res.json()) as T;
-      const body = await res.json().catch(() => ({}));
+      const data = await res.json().catch(() => ({}));
       const retryAfter = Number(res.headers.get("Retry-After") ?? 0) * 1000;
-      err = new ApiError(res.status, body.error ?? `http_${res.status}`, retryAfter);
+      err = new ApiError(res.status, data.error ?? `http_${res.status}`, retryAfter);
       if (!RETRYABLE.has(res.status)) throw err;
     } catch (e) {
       if (e instanceof ApiError && !RETRYABLE.has(e.status)) throw e;
@@ -48,25 +54,6 @@ export async function request<T>(path: string, opts: Options = {}): Promise<T> {
     if (attempt >= retries) throw err;
     await sleep(backoff(attempt, err.retryAfterMs));
   }
-}
-
-// --- demo identity ---------------------------------------------------------
-// a real app reads the user from its login session cookie on the server.
-// here we keep a random id in localStorage so you can test in many tabs
-// (use a private window for a "new" user).
-let cachedUser = "";
-export function userId(): string {
-  if (cachedUser) return cachedUser;
-  try {
-    cachedUser = localStorage.getItem("demo-user-id") ?? "";
-    if (!cachedUser) {
-      cachedUser = `user_${uuid().slice(0, 12)}`;
-      localStorage.setItem("demo-user-id", cachedUser);
-    }
-  } catch {
-    cachedUser = `user_${uuid().slice(0, 12)}`; // storage blocked: per-tab id
-  }
-  return cachedUser;
 }
 
 // --- endpoints ---------------------------------------------------------------
@@ -86,8 +73,21 @@ export interface Reservation {
   reservationId: string;
   status: "pending" | "confirmed" | "rejected";
 }
+export interface User {
+  userId: string;
+  email?: string;
+}
 
 export const api = {
+  // auth: login/register are not retried, so a wrong password isn't sent twice
+  me: () => request<User>("/api/auth/me", { retries: 2 }),
+  login: (email: string, password: string) =>
+    request<User>("/api/auth/login", { method: "POST", body: { email, password } }),
+  register: (email: string, password: string) =>
+    request<User>("/api/auth/register", { method: "POST", body: { email, password } }),
+  logout: () => request<void>("/api/auth/logout", { method: "POST" }),
+
+  // sale
   time: () => request<{ serverTime: number }>("/api/time"),
   status: () => request<SaleStatus>("/api/sale/status"),
   token: () => request<SaleToken>("/api/sale/token", { method: "POST", retries: 3 }),

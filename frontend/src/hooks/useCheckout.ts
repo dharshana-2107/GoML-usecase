@@ -17,7 +17,8 @@ export type Phase =
 
 const BUSY: Phase[] = ["reserving", "queued", "slow"];
 
-export function useCheckout() {
+// onSessionExpired is called when the server says we are no longer signed in.
+export function useCheckout(onSessionExpired?: () => void) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [orderId, setOrderId] = useState("");
   const [errorText, setErrorText] = useState("");
@@ -62,15 +63,20 @@ export function useCheckout() {
     setPhase("reserving"); // optimistic update: instant feedback
     setErrorText("");
     try {
-      if (!token.current) await prepare();
-      if (!token.current) throw new ApiError(0, "network_error");
+      if (!token.current) {
+        // no token yet: fetch one now (this throws not_signed_in if the login expired)
+        const t = await api.token();
+        token.current = { value: t.token, expiresAt: t.expiresAt };
+      }
       const res = await api.checkout(token.current.value, idemKey.current);
       setOrderId(res.reservationId);
       setPhase("queued");
       await waitForOrder(res.reservationId);
     } catch (e) {
       const code = e instanceof ApiError ? e.code : "network_error";
-      if (code === "sold_out" || code === "already_purchased") {
+      if (code === "not_signed_in") {
+        onSessionExpired?.(); // login expired: back to the sign-in screen
+      } else if (code === "sold_out" || code === "already_purchased") {
         setPhase(code);
       } else {
         if (code === "invalid_sale_token") token.current = null;
@@ -81,7 +87,7 @@ export function useCheckout() {
     } finally {
       inFlight.current = false;
     }
-  }, [prepare, waitForOrder]);
+  }, [waitForOrder, onSessionExpired]);
 
   // throttle (leading edge): first tap fires instantly, rapid taps are dropped
   const buy = useMemo(() => throttle(() => void buyNow(), 1500), [buyNow]);

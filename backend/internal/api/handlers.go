@@ -1,5 +1,6 @@
-// package api is the http layer. every handler does a tiny, fixed amount of
-// work (a couple of redis calls at most) and never talks to postgres.
+// package api is the http layer. every sale handler does a tiny, fixed amount
+// of work (a couple of redis calls at most) and never talks to postgres.
+// only register and login use the database, and they happen before the sale.
 package api
 
 import (
@@ -21,16 +22,20 @@ type Publisher interface {
 	Publish(ctx context.Context, msg queue.OrderMessage) error
 }
 
-type Server struct {
-	gate   *stock.Gate
-	pub    Publisher
-	signer auth.Signer
-	sku    string
+// Deps is everything the handlers need.
+type Deps struct {
+	Gate         *stock.Gate
+	Pub          Publisher
+	SaleTokens   auth.Signer // signs the short-lived checkout tokens
+	Sessions     auth.Signer // signs the login cookie
+	Users        Users
+	SKU          string
+	SecureCookie bool // true in production (https only cookies)
 }
 
-func NewServer(gate *stock.Gate, pub Publisher, signer auth.Signer, sku string) *Server {
-	return &Server{gate: gate, pub: pub, signer: signer, sku: sku}
-}
+type Server struct{ Deps }
+
+func NewServer(d Deps) *Server { return &Server{d} }
 
 // Routes wires the endpoints and wraps them with safety middleware.
 func (s *Server) Routes(maxInFlight int) http.Handler {
@@ -40,6 +45,10 @@ func (s *Server) Routes(maxInFlight int) http.Handler {
 		// never cached: the browser uses it once to sync its countdown clock
 		writeJSON(w, http.StatusOK, map[string]int64{"serverTime": time.Now().UnixMilli()})
 	})
+	mux.HandleFunc("POST /api/auth/register", s.register)
+	mux.HandleFunc("POST /api/auth/login", s.login)
+	mux.HandleFunc("POST /api/auth/logout", s.logout)
+	mux.HandleFunc("GET /api/auth/me", s.me)
 	mux.HandleFunc("GET /api/sale/status", s.saleStatus)
 	mux.HandleFunc("POST /api/sale/token", s.saleToken)
 	mux.HandleFunc("POST /api/checkout", s.checkout)
@@ -50,44 +59,46 @@ func (s *Server) Routes(maxInFlight int) http.Handler {
 // saleStatus is polled by every browser. nginx caches it for 1 second, so
 // even 100k pollers turn into roughly one request per second here.
 func (s *Server) saleStatus(w http.ResponseWriter, r *http.Request) {
-	startsAt, err := s.gate.StartsAt(r.Context())
+	startsAt, err := s.Gate.StartsAt(r.Context())
 	if err != nil {
 		fail(w, http.StatusServiceUnavailable, "sale_not_ready", err)
 		return
 	}
-	left, err := s.gate.Remaining(r.Context())
+	left, err := s.Gate.Remaining(r.Context())
 	if err != nil {
 		fail(w, http.StatusServiceUnavailable, "redis_unavailable", err)
 		return
 	}
 	now := time.Now()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"sku": s.sku, "serverTime": now.UnixMilli(), "startsAt": startsAt.UnixMilli(),
+		"sku": s.SKU, "serverTime": now.UnixMilli(), "startsAt": startsAt.UnixMilli(),
 		"live": !now.Before(startsAt) && left > 0, "remaining": left, "soldOut": !now.Before(startsAt) && left == 0,
 	})
 }
 
-// saleToken hands a signed token to a real user who has the page open.
+// saleToken hands a signed token to a signed-in user who has the page open.
 func (s *Server) saleToken(w http.ResponseWriter, r *http.Request) {
-	userID := r.Header.Get("X-User-ID")
-	if !auth.ValidUserID(userID) {
+	userID, ok := s.currentUser(r)
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, errBody("not_signed_in"))
 		return
 	}
-	token, exp := s.signer.Issue(userID, time.Now())
+	token, exp := s.SaleTokens.Issue(userID, time.Now())
 	writeJSON(w, http.StatusOK, map[string]any{"token": token, "expiresAt": exp.UnixMilli()})
 }
 
 // checkout is the hot path: validate, reserve in redis, queue, answer 202.
 func (s *Server) checkout(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	userID, idemKey := r.Header.Get("X-User-ID"), r.Header.Get("Idempotency-Key")
+	idemKey := r.Header.Get("Idempotency-Key")
 
-	if !auth.ValidUserID(userID) {
+	// who you are comes only from the signed cookie, never from a header
+	userID, ok := s.currentUser(r)
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized, errBody("not_signed_in"))
 		return
 	}
-	if err := s.signer.Verify(r.Header.Get("X-Sale-Token"), userID, time.Now()); err != nil {
+	if err := s.SaleTokens.Verify(r.Header.Get("X-Sale-Token"), userID, time.Now()); err != nil {
 		writeJSON(w, http.StatusForbidden, errBody("invalid_sale_token"))
 		return
 	}
@@ -95,7 +106,7 @@ func (s *Server) checkout(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errBody("missing_idempotency_key"))
 		return
 	}
-	startsAt, err := s.gate.StartsAt(ctx)
+	startsAt, err := s.Gate.StartsAt(ctx)
 	if err != nil {
 		fail(w, http.StatusServiceUnavailable, "sale_not_ready", err)
 		return
@@ -105,7 +116,7 @@ func (s *Server) checkout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := s.gate.Reserve(ctx, userID, idemKey)
+	res, err := s.Gate.Reserve(ctx, userID, idemKey)
 	switch {
 	case errors.Is(err, stock.ErrSoldOut):
 		writeJSON(w, http.StatusConflict, errBody("sold_out"))
@@ -123,13 +134,13 @@ func (s *Server) checkout(w http.ResponseWriter, r *http.Request) {
 
 	// a replayed request was already queued the first time, so skip it.
 	if !res.Replayed {
-		msg := queue.OrderMessage{ReservationID: res.ID, UserID: userID, SKU: s.sku, IdempotencyKey: idemKey, ReservedAt: time.Now()}
-		if err := s.pub.Publish(ctx, msg); err != nil {
+		msg := queue.OrderMessage{ReservationID: res.ID, UserID: userID, SKU: s.SKU, IdempotencyKey: idemKey, ReservedAt: time.Now()}
+		if err := s.Pub.Publish(ctx, msg); err != nil {
 			// could not queue the order: give the unit back so it isn't lost.
 			// we use a fresh context because the request one may be cancelled.
 			bg, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			if rerr := s.gate.Release(bg, userID, idemKey, res.ID); rerr != nil {
+			if rerr := s.Gate.Release(bg, userID, idemKey, res.ID); rerr != nil {
 				log.Printf("release failed for %s: %v", res.ID, rerr)
 			}
 			fail(w, http.StatusServiceUnavailable, "try_again", err)
@@ -141,14 +152,18 @@ func (s *Server) checkout(w http.ResponseWriter, r *http.Request) {
 
 // orderStatus lets the browser poll until the worker has saved the order.
 func (s *Server) orderStatus(w http.ResponseWriter, r *http.Request) {
-	userID := r.Header.Get("X-User-ID")
-	owner, state, err := s.gate.Lookup(r.Context(), r.PathValue("id"))
+	userID, ok := s.currentUser(r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, errBody("not_signed_in"))
+		return
+	}
+	owner, state, err := s.Gate.Lookup(r.Context(), r.PathValue("id"))
 	if err != nil {
 		fail(w, http.StatusServiceUnavailable, "try_again", err)
 		return
 	}
 	// hide other people's orders: unknown and "not yours" look the same
-	if owner == "" || owner != userID {
+	if owner != userID {
 		writeJSON(w, http.StatusNotFound, errBody("not_found"))
 		return
 	}
