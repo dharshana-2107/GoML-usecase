@@ -3,7 +3,7 @@
 This document explains how this problem statement can be implemented using Amazon Web Services and make the system production grade, solving the trial error problems.
 ## 1. Core services
  
-| AWS service | What it does | Used in this project instead |
+| AWS service | What it does | Service used in this project |
 |---|---|---|
 | **Amazon RDS for PostgreSQL** | Managed PostgreSQL with Multi-AZ failover, automated backups and point-in-time restore | **PostgreSQL 16** container (`postgres:16-alpine`) |
 | **RDS read replicas** / Multi-AZ DB cluster | Copies of the database in other Availability Zones: a standby takes over on failure, and read replicas serve reads (order history, reports) without loading the primary | **None** — one Postgres container, no replica |
@@ -15,7 +15,7 @@ This document explains how this problem statement can be implemented using Amazo
  
 ## 2. Supporting services
  
-| AWS service | What it does | Used in this project instead |
+| AWS service | What it does | Service used in this project |
 |---|---|---|
 | **Amazon ElastiCache** (Valkey / Redis) | Managed Redis with automatic failover to a replica | **Redis 7** container with append-only file |
 | **Amazon CloudFront** (API cache) | Caches `/api/sale/status` for 1 second at the edge | **nginx** gateway 1-second micro-cache |
