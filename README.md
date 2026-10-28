@@ -187,7 +187,7 @@ docker compose --profile loadtest run --rm k6
 
 The k6 test fails unless exactly 500 reservations succeed with zero dropped requests, timeouts, connection errors, 502, or 504 responses. verify-sale.sh then waits for the workers to drain the queue before printing the results.
 
-[!verify-sale.sh](docs/testing.png)
+![verify-sale.sh](docs/testing.png)
 
 
 ## 5. Running the tests
@@ -319,8 +319,8 @@ This is an assessment-focused implementation, the future scope which can be impl
 
 - **Scale:** The system was tested with up to 100,000 buyers on a local machine, but latency issues persisted due to CPU and hardware limitations. The full capacity target requires production-grade, pre-scaled infrastructure to validate performance under realistic load.
 - **Payment & reservation expiry:** Reservation expiry is out of scope; production would release unpaid reservations after a defined timeout (e.g., 10 minutes) using release.lua.
-- **Redis durability:** AOF `everysec` can lose up to 1 s of writes on a crash. Postgres's conditional update and `CHECK` constraint still prevent overselling; production would add replicas or a managed Redis.
-- **Bot protection:** user-agent filtering and signed tokens are a first layer only; production needs a CDN/WAF challenge.
-- **Account verification:** no email verification, so one person can register several emails; logout does not revoke a copied session token before it expires.
+- **Redis durability:** Redis AOF everysec may lose up to one second of writes during a crash, while PostgreSQL constraints prevent overselling. Production would use Redis replicas or a managed Redis service for improved resilience.
+- **Bot protection:** User-agent filtering and signed tokens are a first layer only. In production level it needs a CDN/WAF challenge.
+- **Account verification:** No email verification, so one person can register several emails and logout does not revoke a copied session token before it expires.
 - **AWS setup:** This project can be done in a better scale using Amazon Web Services which has been explained in detail in [AWS Design](docs/DESIGN.md)
 
