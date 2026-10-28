@@ -26,6 +26,13 @@ REJECTED=$(q "SELECT count(*) FROM orders WHERE sku='$SKU' AND status='rejected'
 DUPES=$(q "SELECT count(*) FROM (SELECT user_id FROM orders WHERE sku='$SKU' AND status='confirmed' GROUP BY user_id HAVING count(*) > 1) d")
 LEFT=$(docker compose exec -T redis redis-cli GET "sale:{$SKU}:stock" | tr -d '[:space:]')
 
+# how many checkout requests redis said yes / no to (the api adds its
+# in-memory "sold out" answers to these counters once a second)
+stat() { docker compose exec -T redis redis-cli HGET "sale:{$SKU}:stats" "$1" | tr -d '[:space:]'; }
+RESERVED=$(stat reserved); SOLD_OUT=$(stat sold_out); ALREADY=$(stat already_bought)
+RESERVED=${RESERVED:-0}; SOLD_OUT=${SOLD_OUT:-0}; ALREADY=${ALREADY:-0}
+TOTAL=$((RESERVED + SOLD_OUT + ALREADY))
+
 REPORT=$(cat <<EOF
 | check              | expected | actual |
 |--------------------|----------|--------|
@@ -34,6 +41,10 @@ REPORT=$(cat <<EOF
 | rejected by db     | 0 | $REJECTED |
 | duplicate buyers   | 0 | $DUPES |
 | redis stock left   | 0 | $LEFT |
+| reserved by redis  | $STOCK | $RESERVED |
+| rejected: sold out | rest | $SOLD_OUT |
+| rejected: 1 per user | rest | $ALREADY |
+| checkout answers   | all | $TOTAL |
 EOF
 )
 echo "$REPORT"
@@ -42,7 +53,7 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   printf '### oversell check\n\n%s\n' "$REPORT" >> "$GITHUB_STEP_SUMMARY"
 fi
 
-if [ "$SOLD" = "$STOCK" ] && [ "$CONFIRMED" = "$STOCK" ] && [ "$DUPES" = "0" ] && [ "$LEFT" = "0" ]; then
+if [ "$SOLD" = "$STOCK" ] && [ "$CONFIRMED" = "$STOCK" ] && [ "$DUPES" = "0" ] && [ "$LEFT" = "0" ] && [ "$RESERVED" = "$STOCK" ]; then
   echo "PASS: exactly $STOCK sold, zero oversell"
 else
   echo "FAIL: consistency check failed" >&2
