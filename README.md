@@ -60,7 +60,7 @@ Then open **http://localhost:8080**:
 
 To act as several buyers, use separate private/incognito windows. A second purchase from the same account is refused (`already_purchased`).
 
-| Command |
+| Setups | Command |
 |---|---|
 | Open the sale immediately | `docker compose run --rm seed -start-in 0s` |
 | Change the stock | `docker compose run --rm seed -stock 50` |
@@ -72,25 +72,7 @@ To act as several buyers, use separate private/incognito windows. A second purch
 
 ## 2. Architecture
 
-```
-                     ┌──────────────────────────── nginx gateway (:8080) ───────────────────────────┐
-  React SPA  ───────►│ static files (hashed, cached 1 yr) · bot UA filter · per-IP / per-user 429   │
-  (≈157 KB)          │ /api/sale/status micro-cached 1 s · least_conn across replicas · keepalive   │
-                     └───────────────────────────────────┬──────────────────────────────────────────┘
-                                                         ▼
-                                           Go API × 3  (stateless, no DB on hot path)
-                                                         │
-                         ┌──── reserve.lua (atomic) ─────┤
-                         ▼                               │ 202 Accepted + reservationId
-                   Redis  stock / buyers / idem          │
-                         ▲                               ▼
-                         │ final state           RabbitMQ quorum queue ──(5 failures)──► DLQ
-                         │                               │
-                         └──────── Go workers × 2 ◄──────┘
-                                         │
-                                         ▼
-                         Postgres:  UPDATE … WHERE sold < total   +   CHECK (sold <= total)
-```
+![System architecture](docs/architecture.png)
 
 **Lifecycle of one checkout**
 
