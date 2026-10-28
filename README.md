@@ -13,7 +13,7 @@ During the initial trial run, the system struggled to handle the load, resulting
 | **CDN** | MinIO- local object storage + Nginx-CDN simulation |
 | **API / Workers** | Go 1.24 — 3 stateless API replicas, 2 worker replicas × 16 goroutines |
 | **Data** | Redis 7 (admission gate), RabbitMQ 4 (quorum queue + DLQ), Postgres 16 |
-| **Verification** | Go race-detector tests, k6 load test, `verify-sale.sh`, GitHub Actions CI |
+| **Testing and Verification** | Go race-detector tests, k6 load test, `verify-sale.sh`, GitHub Actions CI |
 
 
 ---
@@ -210,7 +210,7 @@ The most important tests need a real Redis and Postgres:
 
 | Test | What this proves |
 |---|---|
-| `stock/TestReserveNeverOversells` | 5,000 concurrent goroutines race for 500 units through `reserve.lua` → exactly 500 win. |
+| `stock/TestReserveNeverOversells` | 5,000 concurrent goroutines race for 500 units through `reserve.lua` → exactly 500 purchased. |
 | `orders/TestDatabaseGuardNeverOversells` | Redis bypassed entirely: 600 orders hit Postgres for 500 units → exactly 500 confirmed. |
 | `orders/TestPersistIsIdempotent` | Redelivering the same message produces one order. |
 | `stock/TestReserveIsIdempotent`, `TestOnePerUser`, `TestReleaseReturnsUnitOnce` | Retry safety, one-per-user, release can't double-return stock. |
@@ -245,12 +245,13 @@ npm run dev                       # dev server; proxies /api to the gateway on :
 
 All endpoints are served through nginx on `:8080`. Identity comes only from the signed `fs_session` cookie set at login — never from a request header. Non-browser clients must send a browser-like `User-Agent`.
 
+
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/api/auth/register` | `{email, password}` → sets `fs_session` cookie |
-| `POST` | `/api/auth/login` | `{email, password}` → sets `fs_session` cookie. Same error for unknown email and wrong password. |
+| `POST` | `/api/auth/register` | New account login (`{email, password}` gets set in the `fs_session` cookie) |
+| `POST` | `/api/auth/login` | Existing account login; Will show erros for an unknown email and password |
 | `POST` | `/api/auth/logout` | Clears the cookie |
-| `GET` | `/api/auth/me` | Who is signed in (cookie check only, no DB) |
+| `GET` | `/api/auth/me` | Verifying user (cookie check only, no DB) |
 | `GET` | `/api/time` | Server clock for the countdown |
 | `GET` | `/api/sale/status` | `{sku, startsAt, live, remaining, soldOut}` — cached 1 s by nginx |
 | `POST` | `/api/sale/token` | Signed, user-bound sale token (15 min) |
@@ -262,7 +263,7 @@ All endpoints are served through nginx on `:8080`. Identity comes only from the 
 | Status | Meaning |
 |---|---|
 | `202` | Reserved — `{reservationId, status: "pending"}` |
-| `409 sold_out` / `409 already_purchased` | Final answers |
+| `409 sold_out` / `409 already_purchased` | Final responses |
 | `425 sale_not_started` | Too early |
 | `401 not_signed_in` / `403 invalid_sale_token` | Auth problems |
 | `400 missing_idempotency_key` / `422 idempotency_key_reused` | Bad request |
@@ -293,8 +294,8 @@ nginx/                gateway config + image that builds the React app
 db/migrations/        schema with constraints
 loadtest/             k6 rush scenario
 scripts/              verify-sale.sh
-cdn/, docker-compose.cdn.yml   optional local CDN simulation (see docs/CDN.md)
-docs/                 DESIGN.md (reasoning), CDN.md
+cdn/, docker-compose.cdn.yml   local CDN simulation 
+docs/                 DESIGN.md (AWS), workflow diagrams and output screenshots
 .github/workflows/    CI pipeline
 ```
 
@@ -323,10 +324,10 @@ docs/                 DESIGN.md (reasoning), CDN.md
 ---
 
 ## 10. Future Enhancements
-This is an assessment build. Being explicit about what is **not** proven or implemented:
+This is an assessment-focused implementation, the future scope which can be implemented for production grade is as follows:
 
-- **Scale:** CI proves *correctness* with 10,000–20,000 buyers on one machine (20–40× more buyers than units). The full 100k-requests-in-10-seconds *capacity* target is not demonstrated here; it needs production-sized, pre-scaled infrastructure.
-- **Payment & reservation expiry:** out of scope. Production would expire unpaid reservations (e.g. 10 min) and return them with `release.lua`.
+- **Scale:** The system was tested with up to 100,000 buyers on a local machine, but latency issues persisted due to CPU and hardware limitations. The full capacity target requires production-grade, pre-scaled infrastructure to validate performance under realistic load.
+- **Payment & reservation expiry:** Reservation expiry is out of scope; production would release unpaid reservations after a defined timeout (e.g., 10 minutes) using release.lua.
 - **Redis durability:** AOF `everysec` can lose up to 1 s of writes on a crash. Postgres's conditional update and `CHECK` constraint still prevent overselling; production would add replicas or a managed Redis.
 - **Bot protection:** user-agent filtering and signed tokens are a first layer only; production needs a CDN/WAF challenge.
 - **Account verification:** no email verification, so one person can register several emails; logout does not revoke a copied session token before it expires.
