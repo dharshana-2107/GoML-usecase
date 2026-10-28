@@ -6,7 +6,6 @@ During the initial trial run, the system struggled to handle the load, resulting
 
 **Solution:** The system uses Redis to control access to limited stock, with a single **atomic Lua script** ensuring that only available units can be reserved. Orders are then processed asynchronously through RabbitMQ, Go workers, and PostgreSQL, keeping the checkout process fast even during traffic spikes.
 
-| | |
 |---|---|
 | **Frontend** | React 18 + TypeScript + Vite |
 | **Gateway** | nginx — static hosting, rate limits, load balancing, 1 s micro-cache |
