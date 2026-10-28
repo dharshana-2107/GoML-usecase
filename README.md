@@ -10,6 +10,7 @@ During the initial trial run, the system struggled to handle the load, resulting
 |---|---|
 | **Frontend** | React 18 + TypeScript + Vite |
 | **Gateway** | nginx — static hosting, rate limits, load balancing, 1 s micro-cache |
+| **CDN** | MinIO- local object storage + Nginx-CDN simulation |
 | **API / Workers** | Go 1.24 — 3 stateless API replicas, 2 worker replicas × 16 goroutines |
 | **Data** | Redis 7 (admission gate), RabbitMQ 4 (quorum queue + DLQ), Postgres 16 |
 | **Verification** | Go race-detector tests, k6 load test, `verify-sale.sh`, GitHub Actions CI |
@@ -29,8 +30,9 @@ During the initial trial run, the system struggled to handle the load, resulting
 5. [Running the tests](#5-running-the-tests)
 6. [API reference](#6-api-reference)
 7. [Project layout](#7-project-layout)
-8. [CI/CD](#8-cicd)
-9. [Future Enhancements](#9-known-limits)
+8. [Output Screenshots](#8-output-screenshots)
+9. [CI/CD](#9-cicd)
+10. [Future Enhancements](#10-known-limits)
 
 ---
 
@@ -59,7 +61,7 @@ Then open **http://localhost:8080**:
 2. Watch the countdown, which is synced to the server clock.
 3. Click **Buy now** when it hits zero → *Reserving…* → *Reserved* → *Confirmed*.
 
-To act as several buyers, use separate private/incognito windows. A second purchase from the same account is refused (`already_purchased`).
+Automation test with multiple users explained in [Proving zero oversell](#4-proving-zero-oversell)
 
 | Setups | Command |
 |---|---|
@@ -75,6 +77,7 @@ To act as several buyers, use separate private/incognito windows. A second purch
 
 **Architecture**
 ![System architecture](docs/architecture.png)
+![System architecture](docs/dataflow.png)
 
 **DataFlow**
 ![dataflow](docs/dataflow.png)
@@ -296,8 +299,18 @@ docs/                 DESIGN.md (reasoning), CDN.md
 ```
 
 ---
+## 8. Output Screenshots
+ **Login Page**
+ ![login](docs/login.png)
 
-## 8. CI/CD
+ **Sale**
+ ![sale](docs/sale.png)
+
+ **Purchase Successful**
+ ![purchase](docs/purchased.png)
+
+---
+## 9. CI/CD
 
 `.github/workflows/ci.yml` runs on every push and pull request:
 
@@ -309,7 +322,7 @@ docs/                 DESIGN.md (reasoning), CDN.md
 
 ---
 
-## 9. Future Enhancements
+## 10. Future Enhancements
 This is an assessment build. Being explicit about what is **not** proven or implemented:
 
 - **Scale:** CI proves *correctness* with 10,000–20,000 buyers on one machine (20–40× more buyers than units). The full 100k-requests-in-10-seconds *capacity* target is not demonstrated here; it needs production-sized, pre-scaled infrastructure.
