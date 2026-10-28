@@ -175,10 +175,10 @@ With the stack from the quick start running:
 # 1. reset the sale and open it now
 docker compose run --rm seed -start-in 0s
 
-# 2. pre-sign 20,000 test-user sessions (avoids 20k slow bcrypt logins)
-docker compose run --rm -T seed -sessions 20000 > loadtest/sessions.json
+# 2. pre-sign 100,000 test-user sessions (avoids 20k slow bcrypt logins)
+docker compose run --rm -T seed -sessions 100000 > loadtest/sessions.json
 
-# 3. 20,000 users rush 500 phones
+# 3. 100,000 users rush 500 phones
 docker compose --profile loadtest run --rm k6
 
 # 4. check the database and Redis
@@ -187,16 +187,7 @@ docker compose --profile loadtest run --rm k6
 
 The k6 test fails unless exactly 500 reservations succeed with zero dropped requests, timeouts, connection errors, 502, or 504 responses. verify-sale.sh then waits for the workers to drain the queue before printing the results.
 
-```
-| check              | expected | actual |
-|--------------------|----------|--------|
-| inventory.sold     | 500      | 500    |
-| confirmed orders   | 500      | 500    |
-| rejected by db     | 0        | 0      |
-| duplicate buyers   | 0        | 0      |
-| redis stock left   | 0        | 0      |
-PASS: exactly 500 sold, zero oversell
-```
+[!verify-sale.sh](docs/testing.png)
 
 
 ## 5. Running the tests

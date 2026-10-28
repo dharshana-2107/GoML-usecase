@@ -57,10 +57,23 @@ func TestReserveNeverOversells(t *testing.T) {
 	if won.Load() != 500 {
 		t.Fatalf("expected exactly 500 reservations, got %d", won.Load())
 	}
-	if left, _ := g.Remaining(ctx); left != 0 {
+		if left, _ := g.Remaining(ctx); left != 0 {
 		t.Fatalf("expected 0 units left, got %d", left)
 	}
+
+	// the report counters must add up to every buyer, with none missing
+	if err := g.FlushStats(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st, err := g.ReadStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Reserved != 500 || st.SoldOut != soldOut.Load() || st.Reserved+st.SoldOut != 5000 {
+		t.Fatalf("stats do not add up: %+v (sold out answers: %d)", st, soldOut.Load())
+	}
 }
+
 
 // a retry with the same idempotency key must not take a second unit.
 func TestReserveIsIdempotent(t *testing.T) {

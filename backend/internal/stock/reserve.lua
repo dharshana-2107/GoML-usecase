@@ -8,6 +8,7 @@
 -- KEYS[3] idem     (hash: idempotency key -> reservation id)
 -- KEYS[4] owner    (hash: reservation id -> user id)
 -- KEYS[5] state    (hash: reservation id -> pending | confirmed | rejected)
+-- KEYS[6] stats    (hash: how many buyers got each answer, for reports)
 -- ARGV[1] user id, ARGV[2] idempotency key, ARGV[3] new reservation id
 --
 -- returns {code, reservation id}
@@ -25,12 +26,14 @@ end
 
 -- one phone per user
 if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then
+  redis.call('HINCRBY', KEYS[6], 'already_bought', 1)
   return {-2, ''}
 end
 
 -- the actual stock check and decrement
 local stock = tonumber(redis.call('GET', KEYS[1]) or '0')
 if stock <= 0 then
+  redis.call('HINCRBY', KEYS[6], 'sold_out', 1)
   return {-1, ''}
 end
 
@@ -39,4 +42,5 @@ redis.call('SADD', KEYS[2], ARGV[1])
 redis.call('HSET', KEYS[3], ARGV[2], ARGV[3])
 redis.call('HSET', KEYS[4], ARGV[3], ARGV[1])
 redis.call('HSET', KEYS[5], ARGV[3], 'pending')
+redis.call('HINCRBY', KEYS[6], 'reserved', 1)
 return {1, ARGV[3]}

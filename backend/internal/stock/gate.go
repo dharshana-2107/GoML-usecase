@@ -32,14 +32,16 @@ var (
 // Keys are all the redis keys for one sku. the {sku} part is a redis
 // "hash tag": it keeps every key on the same node in a redis cluster,
 // which lua scripts need.
-type Keys struct{ Stock, Buyers, Idem, Owner, State, StartsAt string }
+type Keys struct{ Stock, Buyers, Idem, Owner, State, StartsAt, Stats string }
 
 func KeysFor(sku string) Keys {
 	p := "sale:{" + sku + "}:"
-	return Keys{p + "stock", p + "buyers", p + "idem", p + "owner", p + "state", p + "starts_at"}
+	return Keys{p + "stock", p + "buyers", p + "idem", p + "owner", p + "state", p + "starts_at", p + "stats"}
 }
 
-func (k Keys) script() []string { return []string{k.Stock, k.Buyers, k.Idem, k.Owner, k.State} }
+func (k Keys) script() []string {
+	return []string{k.Stock, k.Buyers, k.Idem, k.Owner, k.State, k.Stats}
+}
 
 // Reservation is the result of a successful reserve call.
 type Reservation struct {
@@ -49,11 +51,12 @@ type Reservation struct {
 
 // Gate wraps the lua scripts plus two tiny in-memory caches.
 type Gate struct {
-	rdb       *redis.Client
-	keys      Keys
-	reserve   *redis.Script
-	release   *redis.Script
-	soldOutAt atomic.Int64 // unix nanos of the last "sold out" answer
+	rdb        *redis.Client
+	keys       Keys
+	reserve    *redis.Script
+	release    *redis.Script
+	soldOutAt  atomic.Int64 // unix nanos of the last "sold out" answer
+	memSoldOut atomic.Int64
 
 	mu        sync.Mutex
 	startsAt  time.Time
@@ -74,6 +77,7 @@ func (g *Gate) Reserve(ctx context.Context, userID, idemKey string) (Reservation
 	// once we know it is sold out, answer from memory for half a second.
 	// this saves redis from ~95% of the traffic after the last unit goes.
 	if time.Since(time.Unix(0, g.soldOutAt.Load())) < 500*time.Millisecond {
+		g.memSoldOut.Add(1) // counted here, added to redis in batches
 		return Reservation{}, ErrSoldOut
 	}
 	res, err := g.reserve.Run(ctx, g.rdb, g.keys.script(), userID, idemKey, uuid.NewString()).Slice()
@@ -149,11 +153,12 @@ func (g *Gate) StartsAt(ctx context.Context) (time.Time, error) {
 func (g *Gate) Reset(ctx context.Context, units int, startsAt time.Time) error {
 	k := g.keys
 	_, err := g.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
-		p.Del(ctx, k.Buyers, k.Idem, k.Owner, k.State)
+		p.Del(ctx, k.Buyers, k.Idem, k.Owner, k.State, k.Stats)
 		p.Set(ctx, k.Stock, strconv.Itoa(units), 0)
 		p.Set(ctx, k.StartsAt, startsAt.UnixMilli(), 0)
 		return nil
 	})
 	g.soldOutAt.Store(0)
+	g.memSoldOut.Store(0)
 	return err
 }

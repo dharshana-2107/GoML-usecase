@@ -63,8 +63,12 @@ func main() {
 	}
 	defer db.Close()
 
+	gate := stock.NewGate(rdb, cfg.SKU)
+	// adds this pod's "sold out" count to redis once a second (for reports)
+	go gate.RunStatsFlusher(ctx, time.Second)
+
 	srv := api.NewServer(api.Deps{
-		Gate:         stock.NewGate(rdb, cfg.SKU),
+		Gate:         gate,
 		Pub:          pub,
 		SaleTokens:   auth.NewSigner(cfg.TokenSecret, cfg.TokenTTL),
 		Sessions:     auth.NewSessionSigner(cfg.TokenSecret, cfg.SessionTTL),
