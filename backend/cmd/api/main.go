@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
 	"flashsale/internal/api"
@@ -22,6 +23,7 @@ import (
 
 func main() {
 	cfg := config.Load()
+	// refuse to start with a missing or weak secret instead of running unsafely
 	if len(cfg.TokenSecret) < 32 {
 		log.Fatal("SALE_TOKEN_SECRET must be set to at least 32 random characters (see .env.example)")
 	}
@@ -49,7 +51,27 @@ func main() {
 	}
 	defer pub.Close()
 
-	srv := api.NewServer(stock.NewGate(rdb, cfg.SKU), pub, auth.NewSigner(cfg.TokenSecret, cfg.TokenTTL), cfg.SKU)
+	// a small postgres pool, only used by register and login (never by checkout)
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("postgres config: %v", err)
+	}
+	poolCfg.MaxConns = 10
+	db, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		log.Fatalf("postgres: %v", err)
+	}
+	defer db.Close()
+
+	srv := api.NewServer(api.Deps{
+		Gate:         stock.NewGate(rdb, cfg.SKU),
+		Pub:          pub,
+		SaleTokens:   auth.NewSigner(cfg.TokenSecret, cfg.TokenTTL),
+		Sessions:     auth.NewSessionSigner(cfg.TokenSecret, cfg.SessionTTL),
+		Users:        auth.NewUserStore(db),
+		SKU:          cfg.SKU,
+		SecureCookie: cfg.SecureCookie,
+	})
 	httpSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           srv.Routes(cfg.MaxInFlight),

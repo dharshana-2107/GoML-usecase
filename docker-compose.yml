@@ -1,10 +1,12 @@
 # full stack on one machine:
+#   create .env first (see .env.example and the readme)
 #   docker compose up -d --build --wait
 #   docker compose run --rm seed                  # 500 units, opens in 60s
 #   open http://localhost:8080
 #
 # extra tools (not started by "up"):
 #   docker compose run --rm seed -start-in 0s     # open the sale now
+#   docker compose run --rm -T seed -sessions 20000 > loadtest/sessions.json
 #   docker compose --profile loadtest run --rm k6 # fire the load test
 
 x-api: &api
@@ -14,9 +16,11 @@ x-api: &api
     RABBITMQ_URL: amqp://flash:${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}@rabbitmq:5672/
     DATABASE_URL: postgres://app:app@postgres:5432/flashsale?sslmode=disable
     SALE_SKU: PHONE-1
+    # required: compose stops with an error if .env does not set it
     SALE_TOKEN_SECRET: ${SALE_TOKEN_SECRET:?set SALE_TOKEN_SECRET in .env (see .env.example)}
     MAX_IN_FLIGHT: "2000"
   depends_on:
+    postgres: { condition: service_healthy }   # register and login use it
     redis: { condition: service_healthy }
     rabbitmq: { condition: service_healthy }
   restart: unless-stopped
@@ -55,7 +59,9 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: flash
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
-    ports: ["127.0.0.1:15672:15672"]  
+    # management ui only on this machine (127.0.0.1), never on the network.
+    # http://localhost:15672  user: flash  password: RABBITMQ_PASSWORD from .env
+    ports: ["127.0.0.1:15672:15672"]
     volumes: [rabbitdata:/var/lib/rabbitmq]
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]

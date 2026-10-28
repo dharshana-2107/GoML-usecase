@@ -1,7 +1,11 @@
 // k6 load test: thousands of different users rush the checkout at once.
 //
 //   docker compose run --rm seed -start-in 0s
+//   docker compose run --rm -T seed -sessions 20000 > loadtest/sessions.json
 //   docker compose --profile loadtest run --rm k6
+//
+// every fake user is already signed in: the seed tool signs their session
+// cookies, so the test doesn't spend minutes on 20,000 slow password logins.
 //
 // passes only if exactly 500 users got a reservation and no request was
 // dropped (no timeouts, no connection errors, no 502/504).
@@ -9,10 +13,14 @@ import http from "k6/http";
 import { check, sleep } from "k6";
 import { Counter, Rate } from "k6/metrics";
 import exec from "k6/execution";
+import { SharedArray } from "k6/data";
 
 const BASE = __ENV.BASE_URL || "http://localhost:8080";
 const USERS = Number(__ENV.USERS || 20000);
 const STOCK = Number(__ENV.STOCK || 500);
+
+// loaded once and shared by all virtual users (saves memory)
+const SESSIONS = new SharedArray("sessions", () => JSON.parse(open("./sessions.json")));
 
 const reserved = new Counter("reserved");
 const soldOut = new Counter("sold_out");
@@ -41,7 +49,7 @@ http.setResponseCallback(http.expectedStatuses(200, 202, 409, 429));
 export default function () {
   const i = exec.scenario.iterationInTest;
   const headers = {
-    "X-User-ID": `load_${i}`,
+    Cookie: `fs_session=${SESSIONS[i % SESSIONS.length]}`,
     // each fake user comes from its own ip, like real users behind a cdn
     "X-Forwarded-For": `10.${(i >> 16) & 255}.${(i >> 8) & 255}.${i & 255}`,
     "User-Agent": "Mozilla/5.0 (k6 load test)",

@@ -75,3 +75,19 @@ h1 { margin: 0 0 4px; font-size: 28px; }
 .success h2 { margin: 8px 0 4px; color: var(--text); }
 .success p { color: var(--text); margin: 4px 0; }
 .success .muted { color: var(--muted); }
+
+/* sign-in form */
+.login { justify-items: stretch; }
+.login h2 { margin: 0; font-size: 20px; text-align: center; }
+.login label { display: grid; gap: 6px; font-size: 14px; font-weight: 600; }
+.login input {
+  padding: 12px; border-radius: 10px; border: 1px solid var(--line);
+  background: var(--bg); color: var(--text); font-size: 16px;
+}
+.login input:focus-visible { outline: 3px solid var(--accent); outline-offset: 1px; }
+.link {
+  background: none; border: 0; padding: 0; color: var(--accent-dark);
+  font: inherit; text-decoration: underline; cursor: pointer;
+}
+.link:disabled { opacity: 0.5; cursor: not-allowed; }
+.account { margin: 8px 0 0; font-size: 14px; color: var(--muted); }

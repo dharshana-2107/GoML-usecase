@@ -4,3 +4,4 @@ frontend/dist/
 loadtest/k6-summary.json
 coverage.out
 .env
+loadtest/sessions.json

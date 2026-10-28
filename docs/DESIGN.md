@@ -88,10 +88,33 @@ browser ──► nginx ──► api (x3) ──► redis lua (reserve) ──�
 
 **Bundle and TTI.** React 18.3 (smaller than 19), no UI framework, hand-written CSS, an inline SVG instead of images, and a code-split success screen. Build output is about 157 KB raw / 52 KB gzipped, enforced in CI along with a Lighthouse TTI assertion.
 
-## 7. Known limits and production next steps
+## 7. Authentication
+
+Email and password login, built so it never slows down the sale.
+
+```
+before the sale:  browser ──login──► api ──► postgres (bcrypt check) ──► Set-Cookie: fs_session=<signed token>
+during the sale:  browser ──cookie──► api ──► hmac check in memory (no database) ──► redis lua gate
+```
+
+| Decision | Why |
+|---|---|
+| **bcrypt (cost 10)** for passwords | Deliberately slow (~70 ms), so a leaked database can't be brute forced quickly. |
+| **Signed, stateless session cookie** instead of a sessions table | Checking it is an HMAC calculation in memory. Checkout stays free of database calls, exactly as before login existed. |
+| **`HttpOnly`, `SameSite=Strict`, `Secure` in production** | Scripts can't steal it (XSS), other sites can't make the browser send it (CSRF), and it never travels over plain HTTP. |
+| **Separate key for sessions and sale tokens** | Both are derived from one secret, but a sale token can't be replayed as a login cookie or the other way around. |
+| **Same error and timing for unknown email and wrong password** | A dummy bcrypt check runs for unknown emails, so attackers can't discover which emails are registered. |
+| **Limited hashing slots per pod** (`runtime.NumCPU()`) | A burst of logins waits its turn instead of using every CPU and slowing checkout on the same pod. |
+| **Strict rate limit on login/register** (10 per minute per IP, in nginx) | Makes password guessing slow and keeps hashing load bounded. |
+| **`/api/auth/me` reads only the cookie** | Every visitor loads the page at 8 PM; this check must not touch the database. |
+
+**Load testing with login.** Running 20,000 bcrypt logins would take minutes and test the wrong thing. The seed tool signs session cookies for the test users with the same key the API uses (`seed -sessions N`), so k6 measures the sale itself. Login is covered by its own tests.
+
+## 8. Known limits and production next steps
 
 - **Payment** is out of scope. In production a reservation would expire (e.g. 10 minutes) and a sweeper would run `release.lua` for unpaid ones.
 - **Redis durability:** AOF `everysec` can lose up to one second of writes on a crash. The Postgres guard prevents overselling in that case; for stronger guarantees use Redis with replicas plus `WAIT`, or a managed service.
-- **Real identity:** the demo reads `X-User-ID` from the client. Production derives it from the session on the server.
+- **Account abuse:** login proves who you are, but one person can still register several emails. Production adds email or phone verification and limits per payment card or address.
+- **Session revocation:** sessions are stateless HMAC tokens, so logout only deletes the cookie. To cancel stolen sessions, store a per-user session version in Redis and check it (one fast Redis read per request).
 - **Capacity test:** CI proves correctness with 10k users on a small runner. The full 100k-in-10s run belongs on production-sized infrastructure, with nodes pre-scaled before 8 PM (autoscaling is too slow for a 10-second spike).
 - **Observability:** add Prometheus metrics (reservations, 429/503 rates, queue depth, worker lag) and alerts.
