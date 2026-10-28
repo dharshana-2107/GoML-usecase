@@ -9,12 +9,11 @@ During the initial trial run, the system struggled to handle the load, resulting
 | | |
 |---|---|
 | **Frontend** | React 18 + TypeScript + Vite |
-| **Gateway** | nginx — static hosting, bot filter, rate limits, `least_conn` load balancing, 1 s micro-cache |
+| **Gateway** | nginx — static hosting, rate limits, load balancing, 1 s micro-cache |
 | **API / Workers** | Go 1.24 — 3 stateless API replicas, 2 worker replicas × 16 goroutines |
-| **Data** | Redis 7 (admission gate), RabbitMQ 4 (quorum queue + DLQ), Postgres 16 (source of truth) |
+| **Data** | Redis 7 (admission gate), RabbitMQ 4 (quorum queue + DLQ), Postgres 16 |
 | **Verification** | Go race-detector tests, k6 load test, `verify-sale.sh`, GitHub Actions CI |
 
-Deeper reasoning for every decision is in [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ---
 
@@ -70,8 +69,6 @@ To act as several buyers, use separate private/incognito windows. A second purch
 | Follow worker logs | `docker compose logs -f worker` |
 | Stop and wipe all data | `docker compose down -v` |
 
-> If you started an older version of this stack before, run `docker compose down -v` first. Postgres only runs the migrations in `db/migrations/` on a fresh volume, and the `users` table (`002_users.sql`) is required for sign-in.
-
 ---
 
 ## 2. Architecture
@@ -99,60 +96,60 @@ To act as several buyers, use separate private/incognito windows. A second purch
 **Lifecycle of one checkout**
 
 1. Browser fetches a signed **sale token** ~15 s before the start (pre-fetch), so the click is a single request.
-2. nginx drops bots, rate-limits, and routes to the least-busy API replica.
-3. The API verifies the session cookie and sale token (HMAC, in memory), checks the start time, then runs `reserve.lua` in Redis — **one atomic step** that checks stock, enforces one-per-user, records the idempotency key, and decrements.
-4. Winners are published to RabbitMQ **with publisher confirms**; the API answers `202` in milliseconds. If publishing fails, `release.lua` returns the unit and the client gets `503 Retry-After: 1`.
-5. Losers get `409 sold_out` straight from Redis (or from a 500 ms in-memory "sold out" flag on the pod).
+2. nginx drops bots, rate-limits, and routes to the least-busy API.
+3. The API verifies the session cookie and sale token (in memory), checks the start time, then runs `reserve.lua` in Redis — **one atomic step** that checks stock, enforces one-per-user, records the idempotency key, and decrements in the inventory.
+4. Processed orders are published to RabbitMQ **with publisher confirms**; the API answers `202` in milliseconds. If publishing fails, `release.lua` returns the unit and the client gets `503 Retry-After: 1`.
+5. Sold out orders get `409 sold_out` straight from Redis.
 6. Workers write the order to Postgres in one short transaction, set the final state in Redis, then `ack`.
 7. The browser polls `GET /api/orders/{id}` with backoff until `confirmed` or `rejected`.
 
 ---
 
-## 3. How the evaluation framework is met
+## 3. Solutions for the Evaluation Framework
 
-### Problem statement → fix
+### Problem statement
 
-| Trial-run failure | Root cause | Fix in this repo |
+| Bugs | Root cause | Fix in this repo |
 |---|---|---|
 | **540 sold / 500 stock** | Check-then-act race: `SELECT stock` → app checks → `UPDATE`. Many transactions read "1 left" in the gap. | Check + decrement in **one atomic Redis Lua script**; Postgres re-checks with a conditional `UPDATE` and a `CHECK` constraint. |
-| **Database row locks** | Every request contended on one inventory row. | No `SELECT … FOR UPDATE`. Postgres sees only the ~500 winners, each holding a row lock for microseconds. |
-| **High latency / API timeouts** | Synchronous DB writes inside the HTTP request. | API does Redis + queue publish only; DB writes happen in workers. Every layer has short timeouts and load-shedding. |
-| **Poor UX under load** | Double clicks, blind retries, no feedback. | Throttled button, idempotency keys, optimistic UI, explicit states for every outcome. |
+| **Database row locks** | Every request maintains on one inventory row. | No `SELECT … FOR UPDATE`. Postgres sees only the ~500 orders, each holding a row lock for microseconds. |
+| **High latency / API timeouts** | Synchronous DB writes inside the HTTP request. | API does Redis + queue publish only; DB writes happen in the workers. Every layer has short timeouts and load-shedding. |
+| **Poor UX under load** | Double clicks, blind retries, no feedback. | Throttled button, idempotency keys, explicit states for every outcome. |
 
-### 3.1 Frontend strategy (client optimization)
+### 3.1 Frontend strategy
 
-| Technique | Implementation | File |
-|---|---|---|
-| **Throttling (buy button)** | Leading-edge throttle (1.5 s): first tap fires instantly, rapid taps are dropped. Backed by an in-flight ref and a disabled button. | `frontend/src/lib/timing.ts`, `hooks/useCheckout.ts` |
-| **Debouncing** | Used where it belongs: tab-visibility refresh (300 ms). Debounce is deliberately *not* used on the buy button, because it delays the first click. | `hooks/useSaleStatus.ts` |
-| **Idempotency** | One UUID per purchase attempt, reused on every retry, so a retry can never buy twice. | `hooks/useCheckout.ts`, `lib/api.ts` |
-| **Retries** | Only for `429/502/503/504`; honours `Retry-After`; exponential backoff with jitter to avoid synchronized retry waves. | `lib/api.ts`, `lib/timing.ts` |
-| **Asset pre-fetching** | 15 s before start: fetch the sale token and pre-load the code-split success screen. Hashed assets are cached for a year. | `hooks/useCheckout.ts` (`prepare`), `components/SalePage.tsx` |
-| **Polling vs WebSockets** | **Adaptive polling** chosen: 10 s far from start → 1 s in the last 10 s → 2 s during the sale → stops when sold out; pauses in background tabs. nginx caches status for 1 s with `proxy_cache_lock`, so 100k pollers ≈ 1 req/s to the API. WebSockets were rejected: 100k persistent connections, sticky routing and reconnect storms for data that changes only a few times. | `hooks/useSaleStatus.ts`, `nginx/nginx.conf` |
-| **Optimistic UI** | Button switches to *Reserving…* and the stock meter drops by one instantly; rolled back on failure. | `hooks/useCheckout.ts`, `components/SalePage.tsx` |
-| **Server clock sync** | Countdown uses RTT-compensated server time, not the device clock. | `hooks/useSaleStatus.ts` (`useServerClock`) |
-| **Graceful states** | `reserving · queued · confirmed · slow · sold_out · already_purchased · rejected · error`, announced via an `aria-live` banner. | `components/StatusBanner.tsx` |
-| **Bundle size / TTI** | React 18, no UI framework, inline SVG, code splitting → **≈157 KB raw / ≈52 KB gzip**. CI enforces < 200 KB and Lighthouse TTI < 1.5 s. | `.github/workflows/ci.yml`, `frontend/lighthouserc.json` |
+| Technique | Implementation |
+|---|---|
+| **Throttling button** | Leading-edge throttle (1.5 s): first tap fires instantly, rapid taps are dropped. Backed by an in-flight ref and a disabled button. |
+| **Debouncing** | Used where it belongs: tab-visibility refresh (300 ms). Debounce is deliberately *not* used on the buy button, because it delays the first click. |
+| **Idempotency** | One UUID per purchase attempt, reused on every retry, so a retry can never buy twice. |
+| **Retries** | Only for `429/502/503/504`; honours `Retry-After`; exponential backoff with jitter to avoid synchronized retry waves. |
+| **Asset pre-fetching** | 15 s before start: fetch the sale token and pre-load the code-split success screen. Hashed assets are cached for a year. |
+| **Polling vs WebSockets** | **Adaptive polling** chosen: 10 s far from start → 1 s in the last 10 s → 2 s during the sale → stops when sold out; pauses in background tabs. nginx caches status for 1 s with `proxy_cache_lock`, so 100k pollers ≈ 1 req/s to the API. WebSockets were rejected: 100k persistent connections, sticky routing and reconnect storms for data that changes only a few times. |
+| **Optimistic UI** | Button switches to *Reserving…* and the stock meter drops by one instantly; rolled back on failure. |
+| **Server clock sync** | Countdown uses RTT-compensated server time, not the device clock. |
+| **Graceful states** | `reserving · queued · confirmed · slow · sold_out · already_purchased · rejected · error`, announced via an `aria-live` banner. |
+| **Bundle size / TTI** | React 18, no UI framework, inline SVG, code splitting → **≈157 KB raw / ≈52 KB gzip**. CI enforces < 200 KB and Lighthouse TTI < 1.5 s. |
 
 ### 3.2 Backend & middleware architecture
 
-| Concern | Implementation | File |
-|---|---|---|
-| **Load balancing** | nginx `least_conn` over 3 API replicas, 256 upstream keepalive connections. Failed checkouts are retried once on another replica — safe only because every checkout is idempotent. | `nginx/nginx.conf` |
-| **Rate limiting & bots** | User-agent bot filter → per-IP (10 r/s) and per-session (2 r/s) `limit_req` with fast `429` → HMAC sale token bound to the user → one-per-user in Lua. Login/register limited to 10/min per IP. | `nginx/nginx.conf`, `backend/internal/auth/token.go` |
-| **Distributed cache: Redis inventory tokens** | Stock lives in Redis as a counter; `reserve.lua` / `release.lua` are the only code that changes it. Keys use a `{sku}` hash tag so the script works in Redis Cluster. | `backend/internal/stock/` |
-| **Message queue** | RabbitMQ **quorum queue** (replicated), persistent messages, **publisher confirms** before the API says "reserved", delivery limit 5 → dead-letter queue. | `backend/internal/queue/rabbit.go` |
-| **Workers** | Bounded goroutine pool (`WORKER_COUNT`), prefetch = pool size, DB pool sized to match, ack only after commit, graceful shutdown returns unacked messages to the queue. | `backend/cmd/worker/main.go` |
-| **Stateless API** | All config from env; no local state beyond two tiny safe-to-lose caches. Any replica can be killed or added. | `backend/internal/config/config.go`, `docker-compose.yml` |
-| **Overload protection** | Per-request 2 s timeout, concurrency cap (`MAX_IN_FLIGHT`) that answers `503 + Retry-After` immediately instead of queuing, panic recovery, 300 ms Redis timeouts. | `backend/internal/api/middleware.go`, `cmd/api/main.go` |
-| **Authentication** | bcrypt passwords; stateless HMAC session cookie (`HttpOnly`, `SameSite=Strict`), so checkout never hits the DB to identify a user. Separate derived keys for session vs sale tokens. | `backend/internal/auth/`, `internal/api/auth_handlers.go` |
+| Concern | Implementation |
+|---|---|
+| **Load balancing** | nginx `least_conn` over 3 API replicas, 256 upstream keepalive connections. Failed checkouts are retried once on another replica — safe only because every checkout is idempotent. |
+| **Rate limiting & bots** | User-agent bot filter → per-IP (10 r/s) and per-session (2 r/s) `limit_req` with fast `429` → HMAC sale token bound to the user → one-per-user in Lua. Login/register limited to 10/min per IP. |
+| **Distributed cache: Redis inventory tokens** | Stock lives in Redis as a counter; `reserve.lua` / `release.lua` are the only code that changes it. Keys use a `{sku}` hash tag so the script works in Redis Cluster. |
+| **Message queue** | RabbitMQ **quorum queue** (replicated), persistent messages, **publisher confirms** before the API says "reserved", delivery limit 5 → dead-letter queue. |
+| **Workers** | Bounded goroutine pool (`WORKER_COUNT`), prefetch = pool size, DB pool sized to match, ack only after commit, graceful shutdown returns unacked messages to the queue. |
+| **Stateless API** | All config from env; no local state beyond two tiny safe-to-lose caches. Any replica can be killed or added. |
+| **Overload protection** | Per-request 2 s timeout, concurrency cap (`MAX_IN_FLIGHT`) that answers `503 + Retry-After` immediately instead of queuing, panic recovery, 300 ms Redis timeouts. |
+| **Authentication** | bcrypt passwords; stateless HMAC session cookie (`HttpOnly`, `SameSite=Strict`), so checkout never hits the DB to identify a user. Separate derived keys for session vs sale tokens. |
 
 ### 3.3 Database consistency & concurrency control
 
 **Pessimistic vs optimistic locking vs atomic operations**
 
-| Approach | Correct? | Behaviour on one hot row with 100k requests |
-|---|---|---|
+| Approach | Behaviour on one hot row with 100k requests |
+|---|---|
 | **Pessimistic** (`SELECT … FOR UPDATE`) | Yes | Every buyer queues behind one lock → seconds of waiting → lock timeouts, pool exhaustion, API timeouts. This matches the trial-run symptoms. |
 | **Optimistic** (`version` column, retry on conflict) | Yes | No waiting, but nearly every attempt conflicts on a single hot row → retry storm that multiplies load. Good for low contention, bad for a flash sale. |
 | **Atomic conditional update** (`UPDATE … WHERE sold < total`) | Yes | Check and write in one statement; lock held for microseconds. Still one DB round trip per buyer, so it is used only for the ~500 real orders. |
@@ -214,9 +211,6 @@ The k6 run **fails** unless exactly 500 reservations succeed and no request is d
 PASS: exactly 500 sold, zero oversell
 ```
 
-On a laptop, lower the load if needed: `USERS=10000 docker compose --profile loadtest run --rm -e VUS=500 k6`.
-
----
 
 ## 5. Running the tests
 
@@ -262,7 +256,7 @@ npm run dev                       # dev server; proxies /api to the gateway on :
 
 ## 6. API reference
 
-All endpoints are served through nginx on `:8080`. Identity comes **only** from the signed `fs_session` cookie set at login — never from a request header. Non-browser clients must send a browser-like `User-Agent` (bot filter).
+All endpoints are served through nginx on `:8080`. Identity comes only from the signed `fs_session` cookie set at login — never from a request header. Non-browser clients must send a browser-like `User-Agent`.
 
 | Method | Path | Notes |
 |---|---|---|
@@ -328,7 +322,6 @@ docs/                 DESIGN.md (reasoning), CDN.md
 3. **e2e** — full compose stack with fresh random secrets, k6 rush with 10,000 users on 500 units, `verify-sale.sh`; the result table is posted to the run summary.
 4. **publish** — on `main`, pushes `api`, `worker` and `gateway` images to GHCR tagged with the commit SHA.
 
-**Optional:** a local CDN simulation (MinIO as S3 + an nginx edge cache) is described in [`docs/CDN.md`](docs/CDN.md).
 
 ---
 
@@ -340,7 +333,5 @@ This is an assessment build. Being explicit about what is **not** proven or impl
 - **Payment & reservation expiry:** out of scope. Production would expire unpaid reservations (e.g. 10 min) and return them with `release.lua`.
 - **Redis durability:** AOF `everysec` can lose up to 1 s of writes on a crash. Postgres's conditional update and `CHECK` constraint still prevent overselling; production would add replicas or a managed Redis.
 - **Bot protection:** user-agent filtering and signed tokens are a first layer only; production needs a CDN/WAF challenge.
-- **Accounts:** no email verification, so one person can register several emails; logout does not revoke a copied session token before it expires.
-- **Observability:** no metrics or alerting yet (Prometheus for reservations, 429/503 rates, queue depth, worker lag would be next).
+- **Account verification:** no email verification, so one person can register several emails; logout does not revoke a copied session token before it expires.
 
-See [`docs/DESIGN.md`](docs/DESIGN.md) §8 for the production next steps.
