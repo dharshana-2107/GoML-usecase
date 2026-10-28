@@ -30,7 +30,7 @@ func Load() Config {
 		RabbitURL:   env("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
 		DatabaseURL: env("DATABASE_URL", "postgres://app:app@localhost:5432/flashsale?sslmode=disable"),
 		SKU:         env("SALE_SKU", "PHONE-1"),
-		TokenSecret: []byte(env("SALE_TOKEN_SECRET", "dev-only-secret-change-me")),
+		TokenSecret: []byte(os.Getenv("SALE_TOKEN_SECRET")),
 		TokenTTL:    time.Duration(envInt("SALE_TOKEN_TTL_SEC", 900)) * time.Second,
 		MaxInFlight: envInt("MAX_IN_FLIGHT", 2000),
 		WorkerCount: envInt("WORKER_COUNT", 16),
