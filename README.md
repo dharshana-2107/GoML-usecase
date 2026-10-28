@@ -5,7 +5,8 @@ This project simulates a festival flash sale where 500 smartphones become availa
 During the initial trial run, the system struggled to handle the load, resulting in slow responses, database lock timeouts, and failed API requests. More importantly, it sold 540 smartphones despite having only 500 in stock, highlighting a critical inventory management issue.
 
 **Solution:** The system uses Redis to control access to limited stock, with a single **atomic Lua script** ensuring that only available units can be reserved. Orders are then processed asynchronously through RabbitMQ, Go workers, and PostgreSQL, keeping the checkout process fast even during traffic spikes.
-||
+
+| | |
 |---|---|
 | **Frontend** | React 18 + TypeScript + Vite |
 | **Gateway** | nginx — static hosting, rate limits, load balancing, 1 s micro-cache |
