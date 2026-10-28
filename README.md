@@ -73,7 +73,10 @@ To act as several buyers, use separate private/incognito windows. A second purch
 
 ## 2. Architecture
 
+**Architecture**
 ![System architecture](docs/architecture.png)
+
+**DataFlow**
 ![dataflow](docs/dataflow.png)
 
 
