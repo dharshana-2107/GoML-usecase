@@ -30,13 +30,13 @@ During the initial trial run, the system struggled to handle the load, resulting
 6. [API reference](#6-api-reference)
 7. [Project layout](#7-project-layout)
 8. [CI/CD](#8-cicd)
-9. [Known limits](#9-known-limits)
+9. [Future Enhancements](#9-known-limits)
 
 ---
 
 ## 1. Quick start
 
-**Prerequisites:** Docker with Compose v2 and `openssl`. (Go 1.24 and Node 22 are only needed to run tests or the dev server outside Docker.)
+**Prerequisites:** Docker with Compose v2 and `openssl`.
 
 ```bash
 git clone https://github.com/dharshana-2107/GoML-usecase.git
@@ -102,29 +102,28 @@ To act as several buyers, use separate private/incognito windows. A second purch
 
 | Technique | Implementation |
 |---|---|
-| **Throttling button** | Leading-edge throttle (1.5 s): first tap fires instantly, rapid taps are dropped. Backed by an in-flight ref and a disabled button. |
-| **Debouncing** | Used where it belongs: tab-visibility refresh (300 ms). Debounce is deliberately *not* used on the buy button, because it delays the first click. |
+| **Throttling button** | Leading-edge throttle (1.5 s): First tap fires instantly, rapid taps are dropped. Backed by an in-flight ref and a disabled button. |
+| **Debouncing** | Used where it belongs: Tab-visibility refresh (300 ms). Debounce is deliberately *not* used on the buy button, because it delays the first click. |
 | **Idempotency** | One UUID per purchase attempt, reused on every retry, so a retry can never buy twice. |
 | **Retries** | Only for `429/502/503/504`; honours `Retry-After`; exponential backoff with jitter to avoid synchronized retry waves. |
-| **Asset pre-fetching** | 15 s before start: fetch the sale token and pre-load the code-split success screen. Hashed assets are cached for a year. |
-| **Polling vs WebSockets** | **Adaptive polling** chosen: 10 s far from start → 1 s in the last 10 s → 2 s during the sale → stops when sold out; pauses in background tabs. nginx caches status for 1 s with `proxy_cache_lock`, so 100k pollers ≈ 1 req/s to the API. WebSockets were rejected: 100k persistent connections, sticky routing and reconnect storms for data that changes only a few times. |
+| **Asset pre-fetching** | 15 s before start, the sale token is fetched and pre-load to the code-split success screen. |
+| **Polling vs WebSockets** | **Dynamic polling** 10 seconds before the sale, 1 second during the final 10-second countdown, and 2 seconds while the sale is active. Polling stops when stock runs out and pauses when the browser tab is in the background. Nginx caches status for 1 s with `proxy_cache_lock`, so 100k pollers ≈ 1 req/s to the API. WebSockets were rejected because 100k persistent connections, sticky routing and reconnect storms for data that changes only a few times. |
 | **Optimistic UI** | Button switches to *Reserving…* and the stock meter drops by one instantly; rolled back on failure. |
 | **Server clock sync** | Countdown uses RTT-compensated server time, not the device clock. |
 | **Graceful states** | `reserving · queued · confirmed · slow · sold_out · already_purchased · rejected · error`, announced via an `aria-live` banner. |
-| **Bundle size / TTI** | React 18, no UI framework, inline SVG, code splitting → **≈157 KB raw / ≈52 KB gzip**. CI enforces < 200 KB and Lighthouse TTI < 1.5 s. |
 
 ### 3.2 Backend & middleware architecture
 
 | Concern | Implementation |
 |---|---|
-| **Load balancing** | nginx `least_conn` over 3 API replicas, 256 upstream keepalive connections. Failed checkouts are retried once on another replica — safe only because every checkout is idempotent. |
-| **Rate limiting & bots** | User-agent bot filter → per-IP (10 r/s) and per-session (2 r/s) `limit_req` with fast `429` → HMAC sale token bound to the user → one-per-user in Lua. Login/register limited to 10/min per IP. |
+| **Load balancing** | nginx `least_conn` over 3 API replicas, 256 upstream keepalive connections. Failed checkouts are retried once on another replica. This is safe only because every checkout is idempotent. |
+| **Rate limiting & bots** | Requests pass through a user-agent bot filter and rate limits of 10 requests/sec per IP and 2 requests/sec per session, returning fast 429 responses when exceeded, before HMAC sale tokens validate user identity and Redis Lua enforces one purchase per user; login and registration are separately limited to 10 requests/min per IP. |
 | **Distributed cache: Redis inventory tokens** | Stock lives in Redis as a counter; `reserve.lua` / `release.lua` are the only code that changes it. Keys use a `{sku}` hash tag so the script works in Redis Cluster. |
-| **Message queue** | RabbitMQ **quorum queue** (replicated), persistent messages, **publisher confirms** before the API says "reserved", delivery limit 5 → dead-letter queue. |
-| **Workers** | Bounded goroutine pool (`WORKER_COUNT`), prefetch = pool size, DB pool sized to match, ack only after commit, graceful shutdown returns unacked messages to the queue. |
-| **Stateless API** | All config from env; no local state beyond two tiny safe-to-lose caches. Any replica can be killed or added. |
-| **Overload protection** | Per-request 2 s timeout, concurrency cap (`MAX_IN_FLIGHT`) that answers `503 + Retry-After` immediately instead of queuing, panic recovery, 300 ms Redis timeouts. |
-| **Authentication** | bcrypt passwords; stateless HMAC session cookie (`HttpOnly`, `SameSite=Strict`), so checkout never hits the DB to identify a user. Separate derived keys for session vs sale tokens. |
+| **Message queue** | RabbitMQ **quorum queue** (replicated), persistent messages,  **publisher confirms** before the API says "reserved", delivery limit is 5 retries for dead-letter queue. |
+| **Workers** | A bounded goroutine pool with configurable worker count, matched RabbitMQ prefetch and DB pool sizes, acknowledgments only after commit, and graceful shutdown that requeues unacked messages. |
+| **Stateless API** | All config from .env file; Stateless replicas with only two small, disposable caches can be added or removed at any time without disrupting the system. |
+| **Overload protection** | A 2-second per-request timeout, MAX_IN_FLIGHT concurrency cap with immediate 503 + Retry-After, panic recovery, and 300 ms Redis timeouts prevent overload and cascading failures. |
+| **Authentication** | Passwords are bcrypt-hashed, and secure stateless HMAC cookies with separate session and sale-token keys authenticate users without database lookups during checkout. |
 
 ### 3.3 Database consistency & concurrency control
 
@@ -132,20 +131,20 @@ To act as several buyers, use separate private/incognito windows. A second purch
 
 | Approach | Behaviour on one hot row with 100k requests |
 |---|---|
-| **Pessimistic** (`SELECT … FOR UPDATE`) | Yes | Every buyer queues behind one lock → seconds of waiting → lock timeouts, pool exhaustion, API timeouts. This matches the trial-run symptoms. |
-| **Optimistic** (`version` column, retry on conflict) | Yes | No waiting, but nearly every attempt conflicts on a single hot row → retry storm that multiplies load. Good for low contention, bad for a flash sale. |
-| **Atomic conditional update** (`UPDATE … WHERE sold < total`) | Yes | Check and write in one statement; lock held for microseconds. Still one DB round trip per buyer, so it is used only for the ~500 real orders. |
-| **Redis Lua script** | Yes | No locks at all, one round trip, ~100k+ ops/s per core. Used as the front gate. |
+| **Pessimistic** | A single lock forces buyers to wait in sequence, causing delays, lock timeouts, connection pool exhaustion, and API timeouts—consistent with the trial-run symptoms. |
+| **Optimistic** | Avoids waiting but creates heavy contention on a single row, triggering retry storms that amplify load—inefficient for flash sales.|
+| **Atomic conditional update** | A single atomic statement minimizes lock time, but still requires one database round trip per buyer, so it is reserved for the ~500 admitted orders. |
+| **Redis Lua script** | No locks at all, one round trip, Handles 100K+ operations/sec per core, making it ideal as the front-line admission gate. |
 
 **Why Lua in Redis is safer than `SELECT` then `UPDATE` at scale**
 
 1. **Atomic by construction.** Redis executes a script to completion before running any other command, so there is no gap between "check" and "act" — the race that produced 540 sales cannot occur.
-2. **No locks → no lock timeouts.** Each script takes microseconds; nothing waits on anything.
+2. **No locks.** Each script takes microseconds; nothing waits on anything.
 3. **One network round trip** (`EVALSHA`) instead of two statements inside a transaction.
 4. **Several rules in one step:** stock check, one-per-user, idempotency replay and decrement together. In SQL that needs a multi-statement transaction with locks.
-5. **Keeps Postgres out of the spike:** ~99.5% of requests are answered by Redis.
+5. **Keeps Postgres out of the spike:** 99.5% of requests are answered by Redis.
 
-**Defence in depth — Redis is the gate, Postgres is the truth**
+**Redis is the gate and Postgres is the source of truth**
 
 ```sql
 -- worker, inside one short transaction
@@ -157,8 +156,6 @@ INSERT INTO orders (reservation_id, ...) VALUES (...);                  -- PK ma
 - `orders.reservation_id` primary key — a redelivered message can never create a second order.
 - Partial unique index `one_phone_per_user ON orders (user_id, sku) WHERE status = 'confirmed'`.
 - There is exactly one counter per store (`stock` in Redis, `sold` in Postgres), each changed only atomically. The application never reads a number, does arithmetic, and writes it back.
-
-Files: `backend/internal/stock/reserve.lua`, `release.lua`, `backend/internal/orders/processor.go`, `db/migrations/001_init.sql`.
 
 ---
 
@@ -180,7 +177,7 @@ docker compose --profile loadtest run --rm k6
 ./scripts/verify-sale.sh
 ```
 
-The k6 run **fails** unless exactly 500 reservations succeed and no request is dropped (no timeouts, connection errors, `502` or `504`). `verify-sale.sh` then waits for the workers to drain the queue and prints:
+The k6 test fails unless exactly 500 reservations succeed with zero dropped requests, timeouts, connection errors, 502, or 504 responses. verify-sale.sh then waits for the workers to drain the queue before printing the results.
 
 ```
 | check              | expected | actual |
@@ -203,7 +200,7 @@ go test ./...            # unit tests; Redis/Postgres tests are skipped automati
 
 The most important tests need a real Redis and Postgres:
 
-| Test | What it proves |
+| Test | What this proves |
 |---|---|
 | `stock/TestReserveNeverOversells` | 5,000 concurrent goroutines race for 500 units through `reserve.lua` → exactly 500 win. |
 | `orders/TestDatabaseGuardNeverOversells` | Redis bypassed entirely: 600 orders hit Postgres for 500 units → exactly 500 confirmed. |
@@ -307,8 +304,7 @@ docs/                 DESIGN.md (reasoning), CDN.md
 
 ---
 
-## 9. Known limits
-
+## 9. Future Enhancements
 This is an assessment build. Being explicit about what is **not** proven or implemented:
 
 - **Scale:** CI proves *correctness* with 10,000–20,000 buyers on one machine (20–40× more buyers than units). The full 100k-requests-in-10-seconds *capacity* target is not demonstrated here; it needs production-sized, pre-scaled infrastructure.
@@ -316,4 +312,5 @@ This is an assessment build. Being explicit about what is **not** proven or impl
 - **Redis durability:** AOF `everysec` can lose up to 1 s of writes on a crash. Postgres's conditional update and `CHECK` constraint still prevent overselling; production would add replicas or a managed Redis.
 - **Bot protection:** user-agent filtering and signed tokens are a first layer only; production needs a CDN/WAF challenge.
 - **Account verification:** no email verification, so one person can register several emails; logout does not revoke a copied session token before it expires.
+- **AWS setup:** This project can be done in a better scale using Amazon Web Services which has been explained in detail in [AWS Design](docs/DESIGN.md)
 
