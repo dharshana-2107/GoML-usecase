@@ -1,0 +1,19 @@
+# builds the react app, then uploads it to minio (s3) with the aws cli.
+# build context is the repo root.
+
+# ---- build the react app ----
+FROM node:22-alpine AS web
+WORKDIR /web
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+# ---- uploader: aws cli plus the built files ----
+FROM alpine:3.20
+RUN apk add --no-cache aws-cli
+# minio only understands "path style" urls (http://minio:9000/bucket/file)
+RUN aws configure set default.s3.addressing_style path
+COPY --from=web /web/dist /dist
+COPY cdn/upload.sh /upload.sh
+ENTRYPOINT ["/bin/sh", "/upload.sh"]
