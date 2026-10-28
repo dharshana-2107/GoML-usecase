@@ -101,14 +101,14 @@ export function useCheckout(onSessionExpired?: () => void) {
 function messageFor(code: string): string {
   switch (code) {
     case "sale_not_started":
-      return "The sale hasn't started yet. Hang tight!";
+      return "The sale hasn't opened yet. The button unlocks at the start time.";
     case "invalid_sale_token":
-      return "Your session expired. Tap again to retry.";
+      return "Your checkout pass expired. Tap Book now again.";
     case "busy":
     case "try_again":
     case "http_429":
-      return "Huge demand right now. Tap again in a moment.";
+      return "Lots of people are buying right now. Tap Book now again in a few seconds.";
     default:
-      return "Connection problem. Tap again to retry.";
+      return "Couldn't reach the store. Check your connection and tap Book now again.";
   }
 }

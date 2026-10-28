@@ -34,15 +34,15 @@ export function LoginForm({ onSubmit }: Props) {
       await onSubmit(mode, email.trim(), password);
     } catch (err) {
       const code = err instanceof ApiError ? err.code : "network_error";
-      setError(MESSAGES[code] ?? "Something went wrong. Please try again.");
+      setError(MESSAGES[code] ?? "Couldn't reach the store. Check your connection and try again.");
       setBusy(false);
     }
   }
 
   const isLogin = mode === "login";
   return (
-    <form className="card login" onSubmit={submit} noValidate>
-      <h2>{isLogin ? "Sign in to join the sale" : "Create your account"}</h2>
+    <form className="login" onSubmit={submit} noValidate>
+      <h2>{isLogin ? "Sign in to book" : "Create an account to book"}</h2>
 
       <label>
         Email
@@ -67,7 +67,7 @@ export function LoginForm({ onSubmit }: Props) {
         />
       </label>
 
-      <p className="banner banner-error" role="alert">
+      <p className="status status-error" role="alert">
         {error}
       </p>
 
@@ -81,7 +81,7 @@ export function LoginForm({ onSubmit }: Props) {
         className="link"
         onClick={() => (setMode(isLogin ? "register" : "login"), setError(""))}
       >
-        {isLogin ? "New here? Create an account" : "Already have an account? Sign in"}
+        {isLogin ? "New here? Create an account" : "Have an account? Sign in"}
       </button>
     </form>
   );

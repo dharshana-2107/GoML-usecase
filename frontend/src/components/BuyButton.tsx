@@ -3,26 +3,28 @@ import type { Phase } from "../hooks/useCheckout";
 interface Props {
   phase: Phase;
   live: boolean;
+  soldOut: boolean;
   busy: boolean;
+  opensAt: string; // like "8:00 PM", from the server's start time
   onBuy: () => void;
 }
 
 const LABELS: Partial<Record<Phase, string>> = {
-  reserving: "Reserving your phone…",
-  queued: "You're in! Confirming…",
+  reserving: "Reserving…",
+  queued: "Confirming…",
   slow: "Still confirming…",
-  confirmed: "Order confirmed",
   sold_out: "Sold out",
-  already_purchased: "Already purchased",
   rejected: "Sold out",
-  error: "Try again",
+  already_purchased: "Already bought",
+  error: "Book now",
 };
 
 // the button is disabled while a request is in flight and after a final
 // answer, so the ui itself can not spam the api.
-export function BuyButton({ phase, live, busy, onBuy }: Props) {
+export function BuyButton({ phase, live, soldOut, busy, opensAt, onBuy }: Props) {
   const done = ["confirmed", "sold_out", "already_purchased", "rejected"].includes(phase);
-  const label = LABELS[phase] ?? (live ? "Buy now" : "Opens at 8:00 PM");
+  const idle = soldOut ? "Sold out" : live ? "Book now" : `Opens at ${opensAt}`;
+  const label = LABELS[phase] ?? idle;
 
   return (
     <button
