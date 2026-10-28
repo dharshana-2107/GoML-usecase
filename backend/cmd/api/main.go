@@ -22,6 +22,9 @@ import (
 
 func main() {
 	cfg := config.Load()
+	if len(cfg.TokenSecret) < 32 {
+		log.Fatal("SALE_TOKEN_SECRET must be set to at least 32 random characters (see .env.example)")
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
