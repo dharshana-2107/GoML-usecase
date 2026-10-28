@@ -147,7 +147,13 @@ func (s *Server) checkout(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"reservationId": res.ID, "status": "pending"})
+	statusURL := "/api/orders/" + res.ID
+	w.Header().Set("Location", statusURL)
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"reservationId": res.ID,
+		"status":        "pending",
+		"statusUrl":     statusURL,
+	})
 }
 
 // orderStatus lets the browser poll until the worker has saved the order.
