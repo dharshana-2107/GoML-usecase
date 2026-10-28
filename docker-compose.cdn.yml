@@ -1,0 +1,49 @@
+# local cdn simulation, added on top of the main stack:
+#   minio         plays s3: stores the built react files
+#   static-upload builds the react app and uploads it (like a deploy step)
+#   cdn           an nginx "edge" that caches files from s3 and forwards /api
+#
+# start (main stack + cdn):
+#   docker compose -f docker-compose.yml -f docker-compose.cdn.yml up -d --build
+# then browse through the cdn:  http://localhost:8090
+# minio console (this machine only): http://localhost:9001
+
+services:
+  minio:
+    # minio's own images were removed from docker hub in sept 2026.
+    # chainguard rebuilds the same minio server and keeps publishing it.
+    image: cgr.dev/chainguard/minio:latest
+    user: "0:0"   # so it can write to the docker volume
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: flashadmin
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env (8+ characters)}
+    ports: ["127.0.0.1:9001:9001"]   # admin console, never on the network
+    volumes: [miniodata:/data]
+    restart: unless-stopped
+
+  static-upload:
+    build: { context: ., dockerfile: cdn/Dockerfile.upload }
+    environment:
+      # the aws cli reads these to log in to minio
+      AWS_ACCESS_KEY_ID: flashadmin
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env (8+ characters)}
+      AWS_DEFAULT_REGION: us-east-1
+    depends_on: [minio]
+    restart: "no"   # runs once, then exits
+
+  cdn:
+    image: nginx:1.27-alpine
+    volumes: ["./cdn/nginx.conf:/etc/nginx/nginx.conf:ro"]
+    ports: ["8090:80"]
+    depends_on:
+      static-upload: { condition: service_completed_successfully }
+      gateway: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/cdn-health || exit 1"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  miniodata:
