@@ -1,120 +1,119 @@
 # Design notes
 
-This document explains *why* the system is built the way it is. Each section maps to a requirement in the brief.
-
-## 1. Why the old system oversold (540 / 500)
-
-The trial code almost certainly did this:
-
-```sql
-SELECT stock FROM inventory WHERE sku = 'PHONE-1';   -- returns 1
--- application checks: stock > 0 ? yes
-UPDATE inventory SET stock = stock - 1 WHERE sku = 'PHONE-1';
-```
-
-Between the `SELECT` and the `UPDATE` there is a gap of a few milliseconds. Under 100k requests, dozens of transactions read "1 left" inside that gap, all pass the check, and all write. This is a classic **check-then-act race condition**. 40 extra sales is exactly what this race produces under load.
-
-## 2. Pessimistic vs optimistic locking vs atomic operations
-
-| Approach | How it works | Under 100k requests on one row |
+This document explains how this problem statement can be implemented using Amazon Web Services and make the system production grade, solving the trial error problems.
+## 1. Core services
+ 
+| AWS service | What it does | Used in this project instead |
 |---|---|---|
-| **Pessimistic locking** (`SELECT ... FOR UPDATE`) | Lock the row first, then read, check, write, commit. Everyone else waits. | Correct, but every buyer queues behind one lock. Waits grow to seconds, then `lock_timeout` / connection pool exhaustion / API timeouts. **This caused the trial's latency and row-lock timeouts.** |
-| **Optimistic locking** (`version` column) | Read freely, then `UPDATE ... WHERE version = :v`. If 0 rows changed, someone beat you: retry. | Correct, no waiting, but on a single hot row almost every attempt conflicts. 100k clients retrying in a loop multiplies load (a "retry storm"). Good for low-contention data, bad for a flash sale. |
-| **Atomic conditional update** (`UPDATE ... SET sold = sold + 1 WHERE sold < total`) | The check and the write are one statement. The database evaluates the condition on the latest row version. | Correct and simple. The row lock lasts microseconds. Still one round trip to postgres per buyer, so we only use it for the ~500 real orders (see below). |
-| **Redis Lua script** | Check stock, check user, decrement, record: all inside one script. | Correct, ~100k+ ops/s on one core, no locks at all. Used as the front gate. |
-
-### Why Lua in Redis is safer than SELECT-then-UPDATE at scale
-
-1. **Atomicity by design, not by discipline.** Redis runs commands on a single thread and never interleaves another command into a running script. There is no gap between "check" and "act", so the race in section 1 is impossible. With SQL, safety depends on every developer remembering the right isolation level or lock.
-2. **No locks, so no lock timeouts.** Nobody waits on anybody. Each script takes a few microseconds and the next one runs.
-3. **One network round trip.** `SELECT` + `UPDATE` is two round trips plus a transaction. The script is one `EVALSHA` call.
-4. **Several rules in one step.** The script checks stock, enforces one-per-user and records the idempotency key together. Doing that safely in SQL needs a multi-statement transaction with locks.
-5. **It keeps postgres out of the spike.** 99.5% of requests are answered by Redis ("sold out"); postgres only ever sees the 500 winners, at the pace the workers choose.
-
-### Defence in depth
-
-Redis is the *admission gate*; Postgres is the *source of truth*:
-
-- `reserve.lua` admits at most 500 buyers.
-- The worker runs `UPDATE inventory SET sold = sold + 1 WHERE sku = $1 AND sold < total`. If Redis ever lost data in a failover and admitted extra buyers, this statement refuses them (the order is saved as `rejected`).
-- A `CHECK (sold <= total)` constraint makes it impossible to write an oversold row even with a bug in the code.
-- `orders.reservation_id` is the primary key, so a redelivered message can never create a second order, and a partial unique index allows one confirmed phone per user.
-
-**Avoiding "application-level double counters":** there is exactly one counter in each store (`stock` in Redis, `sold` in Postgres), and each is only changed by atomic operations. The application never reads a number, does arithmetic, and writes it back.
-
-## 3. Request lifecycle
-
-```
-browser ──► nginx ──► api (x3) ──► redis lua (reserve) ──► rabbitmq ──► worker (x2) ──► postgres
-            │          │                                                  │
-            │          └─ 202 Accepted {reservationId}  ◄─────────────────┘ sets state in redis
-            └─ browser polls GET /api/orders/{id} until "confirmed"
-```
-
-1. **nginx** drops bot user agents, applies per-IP and per-user rate limits (fast `429`), and spreads requests across API replicas with `least_conn`.
-2. **API** checks the signed sale token, the idempotency key and the start time, runs the Lua script, publishes the order with **publisher confirms**, and answers `202` in a few milliseconds. No database call.
-3. If publishing fails, the API runs `release.lua` to return the unit, then answers `503 Retry-After: 1`. The client retries with the same idempotency key.
-4. **Workers** consume with a bounded goroutine pool (`prefetch = WORKER_COUNT`), save the order in one short transaction, set the final state in Redis, then `ack`. A crash before `ack` means RabbitMQ redelivers; the primary key makes that harmless.
-5. Poison messages go to a **dead-letter queue** after 5 deliveries (quorum queue `x-delivery-limit`).
-
-## 4. Gateway and load balancing
-
-- **`least_conn`** rather than round robin: a replica that is briefly slower gets fewer new requests.
-- **Upstream keepalive** (256 connections): no new TCP handshake per request between nginx and Go.
-- **Safe retries:** `POST /api/checkout` is retried on another replica on `502/503`/timeouts (`non_idempotent`). This is only safe because every checkout carries an idempotency key; a retry can never buy twice.
-- **"0% dropped requests"** is interpreted as: every request gets a definitive answer (`202`, `409`, `429`, `503 + Retry-After`), none time out or are silently dropped. Every layer has a short timeout and returns quickly when it is full (API load shedding with a semaphore, nginx `limit_req` with `nodelay`).
-- **Bot blocking** is layered: cheap user-agent filter in nginx, then the HMAC sale token (only issued to a signed-in user who loaded the page), then per-user rate limits and one-per-user in Lua. In production, add a CDN/WAF bot challenge in front.
-
-## 5. Application logic: stateless and event-loop safe
-
-- API pods keep **no local state** except two tiny caches (sold-out flag for 500 ms, start time for 1 s) that are safe to lose. Any pod can be killed or added.
-- Go has no single event loop; each request runs in its own goroutine across all cores. We still apply the *spirit* of event-loop safety: no blocking CPU work in handlers, every call has a timeout (`context.WithTimeout`, Redis 300 ms read timeout), and a concurrency cap so a slow dependency causes fast `503`s instead of a pile of stuck goroutines.
-- Heavy writes are **decoupled** from HTTP through RabbitMQ.
-
-## 6. Frontend strategy
-
-| Technique | Where | Why |
+| **Amazon RDS for PostgreSQL** | Managed PostgreSQL with Multi-AZ failover, automated backups and point-in-time restore | **PostgreSQL 16** container (`postgres:16-alpine`) |
+| **RDS read replicas** / Multi-AZ DB cluster | Copies of the database in other Availability Zones: a standby takes over on failure, and read replicas serve reads (order history, reports) without loading the primary | **None** — one Postgres container, no replica |
+| **AWS Amplify Hosting** | Builds the frontend from Git and serves it from a global CDN, with preview links per pull request | **nginx** serving the React build, baked into the gateway image |
+| **Amazon SQS** | Fully managed message queue with dead-letter queues; no broker to run | **RabbitMQ 4** quorum queue + dead-letter queue |
+| **Amazon EC2** (with Auto Scaling) | Virtual servers that can be added or removed automatically or on a schedule | **Docker containers**: 3 API replicas, 2 worker replicas |
+| **Elastic Load Balancing** (Application Load Balancer) | Spreads traffic across healthy servers in several data centres | **nginx** `upstream` with `least_conn` |
+| **Amazon CloudFront + Amazon S3 + AWS WAF** (CDN edge) | Static files stored in S3 and cached at edge locations worldwide; WAF filters bots and attacks at the edge before they reach the servers | **MinIO** bucket (S3-compatible) + **nginx edge cache** on `:8090` — optional local CDN simulation, no WAF |
+ 
+## 2. Supporting services
+ 
+| AWS service | What it does | Used in this project instead |
 |---|---|---|
-| **Throttle (leading edge)** | `useCheckout.ts` | First tap fires instantly; taps within 1.5 s are dropped. Plus an `inFlight` ref and a disabled button. |
-| **Debounce** | `useSaleStatus.ts` | Tab-focus refresh. Debounce is *wrong* for a buy button because it delays the first click until clicking stops. |
-| **Idempotency key** | `useCheckout.ts` | Generated once per attempt and sent on every retry, so network retries are safe. |
-| **Retries with jittered backoff** | `api.ts` | Only for `429/502/503/504`, honours `Retry-After`, random jitter prevents synchronized retry waves. |
-| **Asset pre-fetching** | `useCheckout.prepare()` | 15 s before start: fetch the sale token and pre-load the lazy success-screen chunk, so the click is a single request. Hashed assets are cached for a year by nginx. |
-| **Optimistic UI** | `useCheckout` / `App.tsx` | Button shows "Reserving…" and the stock meter drops by one immediately; rolled back on failure. |
-| **Adaptive polling vs WebSockets** | `useSaleStatus.ts` | See below. |
-| **Server clock sync** | `useServerClock` | Countdown follows server time (RTT-compensated), not the device clock. |
-
-**Polling vs WebSockets.** WebSockets push updates instantly, but 100k persistent connections cost memory on every gateway and API node, need sticky routing, and reconnect storms are painful when a node restarts. The sale status only changes a handful of times, so we poll with an **adaptive interval** (10 s far from start, 1 s in the final 10 s, 2 s during the sale, stop when sold out, pause in background tabs). nginx **micro-caches** `/api/sale/status` for 1 s with `proxy_cache_lock`, so 100k pollers cost the API about one request per second. SSE would be a reasonable middle ground if second-level freshness ever mattered.
-
-**Bundle and TTI.** React 18.3 (smaller than 19), no UI framework, hand-written CSS, an inline SVG instead of images, and a code-split success screen. Build output is about 157 KB raw / 52 KB gzipped, enforced in CI along with a Lighthouse TTI assertion.
-
-## 7. Authentication
-
-Email and password login, built so it never slows down the sale.
-
-```
-before the sale:  browser ──login──► api ──► postgres (bcrypt check) ──► Set-Cookie: fs_session=<signed token>
-during the sale:  browser ──cookie──► api ──► hmac check in memory (no database) ──► redis lua gate
-```
-
-| Decision | Why |
+| **Amazon ElastiCache** (Valkey / Redis) | Managed Redis with automatic failover to a replica | **Redis 7** container with append-only file |
+| **Amazon CloudFront** (API cache) | Caches `/api/sale/status` for 1 second at the edge | **nginx** gateway 1-second micro-cache |
+| **AWS WAF** rate-based rules + Bot Control | Blocks bots, known bad IPs and request floods | **nginx** user-agent filter and `limit_req` rate limits at the gateway |
+| **Amazon RDS Proxy** | Pools database connections; keeps them open during a failover | Connection pool inside the Go app (`pgxpool`) |
+| **AWS Secrets Manager** | Stores and rotates secrets, encrypted | **`.env` file** (ignored by git) |
+| **Amazon Route 53** + **ACM** | DNS and free TLS certificates | `localhost`, no HTTPS | — |
+| **Amazon CloudWatch** + **AWS X-Ray** | Metrics, logs, alarms and request tracing | `docker compose logs`, RabbitMQ dashboard |
+| **Amazon ECR** | Private registry for Docker images | **GitHub Container Registry** (GHCR) |
+ 
+---
+ 
+## 3. Why AWS is more advantageous in production
+ 
+The local stack proves the design is **correct**: zero oversell, idempotent retries, a database guard. What it cannot provide is **reliability at scale**, because everything runs on one machine. If that machine fails, the sale stops. AWS removes that single point of failure and takes over the work of running each component.
+ 
+### 3.1 Fault tolerance: the sale survives failures
+ 
+Locally, every component runs once on one machine, so any single failure stops the sale. On AWS, each layer has a spare in another Availability Zone (a separate data centre with its own power and network) and fails over automatically.
+ 
+| Failure | Local result | AWS result |
+|---|---|---|
+| **Database server** | Orders stop until someone restarts the container | **RDS Multi-AZ** promotes the standby automatically; **RDS Proxy** holds application connections open during the switch |
+| **Database data loss** | Only what is on the local disk; no backups | **Read replicas / standbys** keep live copies in other AZs; automated backups restore to any second in the retention window |
+| **Redis** | Sale pauses; up to 1 s of writes lost | **ElastiCache Multi-AZ** promotes a replica; any writes lost in the switch are still caught by the Postgres guard (`sold < total`) |
+| **Message broker** | One RabbitMQ node; if it is down, checkouts get `503` | **SQS** has no broker to fail: each message is stored across several Availability Zones |
+| **A worker crashes mid-order** | RabbitMQ redelivers the message | Same: the message reappears after the SQS **visibility timeout**; the `reservation_id` primary key makes the retry harmless |
+| **A poison message** | Moved to the RabbitMQ dead-letter queue | Moved to the **SQS DLQ** after 5 attempts; a **CloudWatch alarm** pages the on-call engineer, and **DLQ redrive** replays it after the fix |
+| **An API server** | nginx skips it; no replacement | **ALB health checks** stop sending it traffic; **Auto Scaling** replaces it automatically |
+| **A whole data centre** | Everything is down | Traffic shifts to the other two Availability Zones |
+| **A traffic flood or DDoS** | nginx and the host are overwhelmed | **CloudFront**, **Shield** and **WAF** absorb and filter it at the edge, before it reaches the VPC |
+ 
+ 
+### 3.2 Multi-AZ, multi-region and compatibility
+ 
+**Multi-AZ by default.** RDS, ElastiCache, SQS, the load balancer and the EC2 groups all span 3 Availability Zones. This needs no change to the application code.
+ 
+**Multi-region when needed.** If the sale must survive the loss of an entire AWS region:
+ 
+- **Route 53 health checks** fail DNS over to a standby region.
+- A **cross-region RDS read replica** (or Aurora Global Database) keeps the database copied to the second region, ready to be promoted.
+- **CloudFront** and **Amplify** already serve the frontend from edge locations worldwide, so the page stays fast for users everywhere.
+One region with 3 Availability Zones covers most failures, so multi-region is a future option rather than a launch requirement.
+ 
+**Compatible with the tools used locally.** The project was built on open-source tools that have AWS-managed, protocol-compatible equivalents, so most of the code moves over unchanged:
+ 
+| Local tool | AWS equivalent | Changes required in the code |
+|---|---|---|
+| PostgreSQL 16 | RDS for PostgreSQL (or Aurora PostgreSQL-Compatible) | Connection string and TLS only; schema, constraints and queries are identical |
+| Redis 7 + Lua scripts | ElastiCache for Valkey / Redis OSS | Endpoint and TLS only; `reserve.lua` and `release.lua` run unchanged |
+| MinIO | Amazon S3 | Nothing; MinIO speaks the S3 API, and `cdn/upload.sh` already uses the AWS CLI |
+| Docker images | EC2 / ECS, images stored in ECR | Nothing; the same `api` and `worker` images run as-is |
+| RabbitMQ | Amazon MQ for RabbitMQ (no change) or SQS (small rewrite) | Choice between zero change and a fully serverless queue |
+| nginx `least_conn` | ALB *least outstanding requests* | Configuration only |
+ 
+It also runs on **Graviton (ARM)** instances: Go cross-compiles for ARM with one build flag, giving better price-performance than x86.
+ 
+### 3.3 Scale: 
+ 
+- **EC2 scheduled scaling** adds servers at 7:30 PM and removes them after the sale, so the extra capacity costs money only for the sale window.
+- **ALB capacity reservation** pre-warms the load balancer for the 10,000-requests-per-second jump, instead of letting it scale up mid-spike.
+- **CloudFront** serves the page and the cached sale status from edge locations worldwide, so 100,000 browsers polling the status cost the servers about one request per second.
+- **Amplify** serves the React app from a CDN, so page loads at 8 PM never reach the servers at all.
+### 3.4 Security: protection before traffic reaches the servers
+ 
+- **AWS WAF + Bot Control** blocks bots and abusive IPs at the edge, with browser challenges that headless scripts fail. Locally, nginx only checks the user-agent string, which any script can fake.
+- **AWS Shield Standard** protects against network-level DDoS attacks at no extra cost.
+- **Secrets Manager** replaces a plain `.env` file: secrets are encrypted, access is logged, and database passwords rotate automatically.
+- **Private networking (VPC):** the database and cache have no internet access at all; only the load balancer is reachable, and only through CloudFront.
+### 3.5 Operations: less to run by hand
+ 
+| Task | Local | AWS |
+|---|---|---|
+| Database backups | Manual | Automatic, with restore to any second in the retention window |
+| Scaling reads | Not possible | Add an **RDS read replica**; send reporting and order-history queries to it |
+| Patching Postgres, Redis, RabbitMQ | Manual image updates | Managed by AWS |
+| Noticing a problem during the sale | Watching logs | **CloudWatch alarms** page the on-call engineer (e.g. any message in the dead-letter queue) |
+| Tracing a slow request | Not possible | **X-Ray** shows the time spent in each service |
+| Frontend deploys | Rebuild the nginx image | **Amplify** deploys on every push, with a preview link per pull request |
+ 
+### 3.6 Room to grow
+ 
+ 
+- **Virtual Waiting Room on AWS** — admit buyers in fair batches instead of all at once.
+- **EventBridge Scheduler + Lambda** — release unpaid reservations after 10 minutes.
+- **Step Functions** — a payment flow that refunds and releases the unit automatically if a step fails.
+- **Amazon SES** — order confirmation emails.
+- **Amazon Cognito** — verified sign-up and multi-factor authentication.
+---
+ 
+## 4. Trade-offs
+ 
+AWS is the better choice for the production sale, but it is not free of costs:
+ 
+| Trade-off | Detail |
 |---|---|
-| **bcrypt (cost 10)** for passwords | Deliberately slow (~70 ms), so a leaked database can't be brute forced quickly. |
-| **Signed, stateless session cookie** instead of a sessions table | Checking it is an HMAC calculation in memory. Checkout stays free of database calls, exactly as before login existed. |
-| **`HttpOnly`, `SameSite=Strict`, `Secure` in production** | Scripts can't steal it (XSS), other sites can't make the browser send it (CSRF), and it never travels over plain HTTP. |
-| **Separate key for sessions and sale tokens** | Both are derived from one secret, but a sale token can't be replayed as a login cookie or the other way around. |
-| **Same error and timing for unknown email and wrong password** | A dummy bcrypt check runs for unknown emails, so attackers can't discover which emails are registered. |
-| **Limited hashing slots per pod** (`runtime.NumCPU()`) | A burst of logins waits its turn instead of using every CPU and slowing checkout on the same pod. |
-| **Strict rate limit on login/register** (10 per minute per IP, in nginx) | Makes password guessing slow and keeps hashing load bounded. |
-| **`/api/auth/me` reads only the cookie** | Every visitor loads the page at 8 PM; this check must not touch the database. |
-
-**Load testing with login.** Running 20,000 bcrypt logins would take minutes and test the wrong thing. The seed tool signs session cookies for the test users with the same key the API uses (`seed -sessions N`), so k6 measures the sale itself. Login is covered by its own tests.
-
-## 8. Known limits and production next steps
-
-- **Payment** is out of scope. In production a reservation would expire (e.g. 10 minutes) and a sweeper would run `release.lua` for unpaid ones.
-- **Redis durability:** AOF `everysec` can lose up to one second of writes on a crash. The Postgres guard prevents overselling in that case; for stronger guarantees use Redis with replicas plus `WAIT`, or a managed service.
-- **Account abuse:** login proves who you are, but one person can still register several emails. Production adds email or phone verification and limits per payment card or address.
-- **Session revocation:** sessions are stateless HMAC tokens, so logout only deletes the cookie. To cancel stolen sessions, store a per-user session version in Redis and check it (one fast Redis read per request).
-- **Capacity test:** CI proves correctness with 10k users on a small runner. The full 100k-in-10s run belongs on production-sized infrastructure, with nodes pre-scaled before 8 PM (autoscaling is too slow for a 10-second spike).
-- **Observability:** add Prometheus metrics (reservations, 429/503 rates, queue depth, worker lag) and alerts.
+| **Cost** | Managed services cost more than containers on one machine, especially Multi-AZ databases and WAF Bot Control. Scheduled scaling keeps the peak cost limited to the sale window. |
+| **Vendor lock-in** | SQS, Amplify and WAF are AWS-specific. Keeping the queue behind the existing `Publisher` interface limits the impact. |
+| **Local development** | Docker Compose stays the way to develop and test locally, so both setups must be kept in sync. |
+ 
+ 
