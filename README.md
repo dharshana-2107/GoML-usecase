@@ -77,7 +77,6 @@ Automation test with multiple users explained in [Proving zero oversell](#4-prov
 
 **Architecture**
 ![System architecture](docs/architecture.png)
-![System architecture](docs/dataflow.png)
 
 **DataFlow**
 ![dataflow](docs/dataflow.png)
