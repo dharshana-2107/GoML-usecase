@@ -22,7 +22,6 @@ This document explains how this problem statement can be implemented using Amazo
 
  
 | AWS service | What it does | Service used in this project |
-=======
 |---|---|---|
 | **Amazon ElastiCache** (Valkey / Redis) | Managed Redis with automatic failover to a replica | **Redis 7** container with append-only file |
 | **Amazon CloudFront** (API cache) | Caches `/api/sale/status` for 1 second at the edge | **nginx** gateway 1-second micro-cache |
