@@ -19,13 +19,10 @@ This document explains how this problem statement can be implemented using Amazo
 **Why ECS:** the project has two services (API and workers), and each Docker Compose service maps directly to one ECS service. ECS has no control-plane charge and needs no Kubernetes manifests. The same Docker images run unchanged.
 
 ## 2. Supporting services
-<<<<<<< HEAD
+
  
 | AWS service | What it does | Service used in this project |
 =======
-
-| AWS service | What it does | Used in this project instead |
->>>>>>> b85607f (output screenshots)
 |---|---|---|
 | **Amazon ElastiCache** (Valkey / Redis) | Managed Redis with automatic failover to a replica | **Redis 7** container with append-only file |
 | **Amazon CloudFront** (API cache) | Caches `/api/sale/status` for 1 second at the edge | **nginx** gateway 1-second micro-cache |
