@@ -142,10 +142,6 @@ AWS is the better choice for the production sale, but it is not free of costs:
 |---|---|
 | **Cost** | Managed services cost more than containers on one machine, especially Multi-AZ databases and WAF Bot Control. Scheduled scaling keeps the peak cost limited to the sale window. |
 | **Vendor lock-in** | SQS, Amplify and WAF are AWS-specific. Keeping the queue behind the existing `Publisher` interface limits the impact. |
-<<<<<<< HEAD
 | **Local development** | Docker Compose stays the way to develop and test locally, so both setups must be kept in sync. |
  
  
-=======
-| **Local development** | Docker Compose stays the way to develop and test locally, so both setups must be kept in sync. |
->>>>>>> b85607f (output screenshots)
